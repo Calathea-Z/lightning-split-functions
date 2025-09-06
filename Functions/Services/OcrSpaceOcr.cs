@@ -21,7 +21,6 @@ public sealed class OcrSpaceOcr : IReceiptOcr
     private readonly ILogger<OcrSpaceOcr> _logger;
     private readonly string _apiKey;
 
-    // Register named client in Program.cs: builder.Services.AddHttpClient("ocrspace", c => c.Timeout = TimeSpan.FromSeconds(30));
     public OcrSpaceOcr(IHttpClientFactory httpFactory, ILogger<OcrSpaceOcr> logger, string apiKey)
     {
         _httpFactory = httpFactory ?? throw new ArgumentNullException(nameof(httpFactory));

@@ -2,11 +2,10 @@
 using Functions.Helpers;
 using System.Text.RegularExpressions;
 using System.Linq;
+using Functions.Contracts.HueristicExtractor;
 
 namespace Functions.Services
 {
-    public sealed record ParsedItem(string Description, int Qty, decimal UnitPrice, decimal? TotalPrice);
-    public sealed record ParsedReceipt(List<ParsedItem> Items, decimal? Subtotal, decimal? Tax, decimal? Tip, decimal? Total, bool IsSane);
 
     public static class HeuristicExtractor
     {
@@ -42,10 +41,6 @@ namespace Functions.Services
         // qty anywhere in the description (prefix OR suffix)
         private static readonly Regex QtyAnywhere = new(
             @"(?:(?<q1>\d{1,3})\s*[x×]\b)|(?:\b[x×]\s*(?<q2>\d{1,3}))",
-            RegexOptions.Compiled | RegexOptions.IgnoreCase);
-
-        private static readonly Regex QtyPrefixStrip = new(
-            @"^\s*\d{1,3}\s*[x×]\s*",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex TotalsLabel = new(
@@ -149,48 +144,67 @@ namespace Functions.Services
                         {
                             var qty = ExtractQtyFromDesc(line) ?? 1;
 
-                            // If we are right before totals and we know the printed Subtotal,
-                            // choose the interpretation that best matches the printed Subtotal.
-                            if (qty > 0 && NextNextIsTotals(lines, i) && previewSubtotal is decimal sub)
+                            if (qty > 1)
+                            {
+                                // Two interpretations:
+                                // (A) money is UNIT → line total = unit * qty
+                                // (B) money is TOTAL → unit = total / qty
+                                decimal unitA = money;
+                                decimal totalA = Round2(unitA * qty);
+
+                                decimal totalB = money;
+                                decimal unitB = qty > 0 ? Round2(totalB / qty) : totalB;
+
+                                // Choose the interpretation that keeps us closer to printed subtotal (when available)
+                                decimal sumIfA = Round2(runningItemsSum + totalA);
+                                decimal sumIfB = Round2(runningItemsSum + totalB);
+
+                                bool chooseB = false;
+                                if (previewSubtotal is decimal sub2)
+                                    chooseB = Math.Abs(sumIfB - sub2) + 0.0001m < Math.Abs(sumIfA - sub2);
+
+                                if (chooseB)
+                                {
+                                    items.Add(new ParsedItem(rawDesc, qty, unitB, totalB));
+                                    runningItemsSum = sumIfB;
+                                }
+                                else
+                                {
+                                    items.Add(new ParsedItem(rawDesc, qty, unitA, totalA));
+                                    runningItemsSum = sumIfA;
+                                }
+
+                                i++; // consume money line
+                                continue;
+                            }
+
+                            // qty == 1: keep smart tie-breaker near totals using printed Subtotal
+                            if (NextNextIsTotals(lines, i) && previewSubtotal is decimal sub)
                             {
                                 decimal asTotal = Round2(runningItemsSum + money);
-                                decimal asUnit = Round2(runningItemsSum + Round2(money * qty));
+                                decimal asUnit = Round2(runningItemsSum + money); // qty=1 → same
 
-                                // pick the one closer to the printed subtotal
-                                var pickTotal = Math.Abs(asTotal - sub) <= Math.Abs(asUnit - sub) + 0.0001m;
+                                var pickTotal = Math.Abs(asTotal - sub) + 0.0001m < Math.Abs(asUnit - sub);
 
+                                var unit = money;
+                                var totalLine = unit; // qty=1
                                 if (pickTotal)
                                 {
-                                    var unit = Round2(money / qty);
-                                    var newItem = new ParsedItem(rawDesc, qty, unit, money);
-                                    items.Add(newItem);
+                                    items.Add(new ParsedItem(rawDesc, 1, unit, totalLine));
                                     runningItemsSum = asTotal;
                                 }
                                 else
                                 {
-                                    var unit = money;
-                                    var totalLine = Round2(unit * qty);
-                                    var newItem = new ParsedItem(rawDesc, qty, unit, totalLine);
-                                    items.Add(newItem);
+                                    items.Add(new ParsedItem(rawDesc, 1, unit, totalLine));
                                     runningItemsSum = asUnit;
                                 }
                             }
                             else
                             {
-                                // default behavior away from totals
-                                if (qty > 1)
-                                {
-                                    var unit = money;
-                                    var totalLine = Round2(unit * qty);
-                                    items.Add(new ParsedItem(rawDesc, qty, unit, totalLine));
-                                    runningItemsSum = Round2(runningItemsSum + totalLine);
-                                }
-                                else
-                                {
-                                    var unit = money;
-                                    items.Add(new ParsedItem(rawDesc, 1, unit, unit));
-                                    runningItemsSum = Round2(runningItemsSum + unit);
-                                }
+                                // default for qty=1 away from totals
+                                var unit = money;
+                                items.Add(new ParsedItem(rawDesc, 1, unit, unit));
+                                runningItemsSum = Round2(runningItemsSum + unit);
                             }
 
                             i++; // consume money line
@@ -460,6 +474,10 @@ namespace Functions.Services
         }
 
         private static string StripQtyPrefix(string s) => QtyPrefixStrip.Replace(s, "");
+        private static readonly Regex QtyPrefixStrip = new(
+            @"^\s*\d{1,3}\s*[x×]\s*",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
         private static string Clean(string s) => Regex.Replace(s, @"\s{2,}", " ").Trim();
         private static decimal Round2(decimal d) => Math.Round(d, 2, MidpointRounding.AwayFromZero);
 

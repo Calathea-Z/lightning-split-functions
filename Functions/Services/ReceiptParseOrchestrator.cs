@@ -8,7 +8,6 @@ using Functions.Infrastructure.Logging;
 using Functions.Models;
 using Functions.Services.Abstractions;
 using Microsoft.Extensions.Logging;
-using System.Diagnostics;
 
 namespace Functions.Services;
 
@@ -38,8 +37,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
     private const string LockContainer = "receipt-parse-locks";
 
     // Resilience
-    private const int MaxAttempts = 4;
-    private static readonly TimeSpan BaseDelay = TimeSpan.FromMilliseconds(250);
     private static readonly TimeSpan ShortTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan OcrTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ApiTimeout = TimeSpan.FromSeconds(10);
@@ -79,19 +76,25 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
             var blobClient = _blobSvc.GetBlobContainerClient(req.Container).GetBlobClient(req.Blob);
 
             var props = await RetryAsync<Response<BlobProperties>>(
-                "blob.getProperties",
-                ShortTimeout,
-                () => blobClient.GetPropertiesAsync(cancellationToken: ct),
-                IsTransientBlob);
+                op: "blob.getProperties",
+                perAttemptTimeout: ShortTimeout,
+                action: ct2 => blobClient.GetPropertiesAsync(cancellationToken: ct2),
+                isTransient: IsTransientBlob,
+                maxAttempts: 3,
+                log: _log,
+                outer: ct);
 
-            if (props.Value.ContentLength > MaxBlobBytes)
-                throw new InvalidOperationException($"Blob too large ({props.Value.ContentLength} bytes). Max {MaxBlobBytes}.");
+            if (props.Value.ContentLength > 50L * 1024 * 1024)
+                throw new InvalidOperationException($"Blob too large ({props.Value.ContentLength} bytes). Max {50L * 1024 * 1024}.");
 
             var original = await RetryAsync<Stream>(
-                "blob.openRead",
-                ShortTimeout,
-                () => blobClient.OpenReadAsync(cancellationToken: ct),
-                IsTransientBlob);
+                op: "blob.openRead",
+                perAttemptTimeout: ShortTimeout,
+                action: ct2 => blobClient.OpenReadAsync(cancellationToken: ct2),
+                isTransient: IsTransientBlob,
+                maxAttempts: 3,
+                log: _log,
+                outer: ct);
 
             await using (original)
             {
@@ -102,12 +105,27 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
 
                 // 3) OCR
                 _log.OcrRequested(rid, _ocr.GetType().Name);
-                var rawText = await RetryAsync<string?>("ocr.read", OcrTimeout, () => _ocr.ReadAsync(pre, ct), IsTransientOcr);
+                var rawText = await RetryAsync<string?>(
+                    op: "ocr.read",
+                    perAttemptTimeout: OcrTimeout,
+                    action: ct2 => _ocr.ReadAsync(pre, ct2),
+                    isTransient: IsTransientOcr,
+                    maxAttempts: 3,
+                    log: _log,
+                    outer: ct);
+
                 if (string.IsNullOrWhiteSpace(rawText))
                     _log.LogWarning("OCR returned empty text");
 
                 // 4) Persist raw (idempotent)
-                await RetryAsync("api.patchRaw", ApiTimeout, () => _api.PatchRawTextAsync(rid, rawText ?? string.Empty, ct), IsTransientApi);
+                await RetryAsync(
+                    op: "api.patchRaw",
+                    perAttemptTimeout: ApiTimeout,
+                    action: ct2 => _api.PatchRawTextAsync(rid, rawText ?? string.Empty, ct2),
+                    isTransient: IsTransientApi,
+                    maxAttempts: 3,
+                    log: _log,
+                    outer: ct);
 
                 // 5) Heuristics
                 var parsed = HeuristicExtractor.Extract(rawText ?? string.Empty);
@@ -115,61 +133,65 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 if (!parsed.IsSane || parsed.Items.Count == 0)
                     _log.NeedsReview(rid, "Weak heuristic extraction");
 
-                // 6) Create items (no retries to avoid dupes)
+                // 6) Create items (skip any adjustment-like lines; API owns that)
                 foreach (var it in parsed.Items)
                 {
-                    var payload = new CreateReceiptItemDto(Label: it.Description, Qty: it.Qty, UnitPrice: it.UnitPrice);
+                    var desc = (it.Description ?? string.Empty).Trim();
+                    if (desc.Length == 0) continue;
+                    if (string.Equals(desc, "Adjustment", StringComparison.OrdinalIgnoreCase)) continue;
+                    if (string.Equals(desc, "Discount/Adjustment", StringComparison.OrdinalIgnoreCase)) continue;
+
+                    var payload = new CreateReceiptItemDto(Label: desc, Qty: it.Qty, UnitPrice: it.UnitPrice);
                     await _api.PostItemAsync(rid, payload, ct);
                 }
 
-                // 7) Auto-adjustment + totals
+                // 7) Build totals for API call (ensure TOTAL is non-nullable decimal)
                 var sumOfItems = parsed.Items.Sum(i => i.UnitPrice * i.Qty);
-                var declaredTotal = parsed.Total ?? 0m;
-                var delta = Math.Round(declaredTotal - sumOfItems, 2, MidpointRounding.AwayFromZero);
-                var allow = Math.Max(1.00m, Math.Round(declaredTotal * 0.03m, 2, MidpointRounding.AwayFromZero));
 
-                if (Math.Abs(delta) > allow && declaredTotal > 0)
-                {
-                    await _api.PostItemAsync(rid, new CreateReceiptItemDto(
-                        Label: delta < 0 ? "Discount/Adjustment" : "Adjustment",
-                        Qty: 1m,
-                        UnitPrice: Math.Round(delta, 2, MidpointRounding.AwayFromZero),
-                        Unit: null,
-                        Category: "Adjustment",
-                        Notes: "Auto-reconcile",
-                        Position: parsed.Items.Count + 1
-                    ), ct);
-                    sumOfItems += delta;
-                }
+                decimal? subOpt = parsed.Subtotal;
+                decimal? taxOpt = parsed.Tax;
+                decimal? tipOpt = parsed.Tip;
 
-                var sub = parsed.Subtotal ?? 0m;
-                var tax = parsed.Tax;
-                var tip = parsed.Tip;
-                var total = parsed.Total ?? 0m;
+                if (subOpt is null && parsed.Items.Count > 0)
+                    subOpt = Round2(sumOfItems);
 
-                var norm = ReceiptTotalsSanitizer.Normalize(sub, tax, tip, total, sumOfItems);
-                var residual = Math.Abs(sumOfItems - norm.total);
-                var hardAllow = Math.Max(1.00m, Math.Round(norm.total * 0.05m, 2, MidpointRounding.AwayFromZero));
-                if (residual > hardAllow)
-                    norm = (Round2(sumOfItems), norm.tax, norm.tip, Round2(sumOfItems + (norm.tax ?? 0m) + (norm.tip ?? 0m)));
+                // Prefer printed total if present; else compute
+                var totalRounded = Round2(parsed.Total ?? ((subOpt ?? 0m) + (taxOpt ?? 0m) + (tipOpt ?? 0m)));
 
-                await RetryAsync("api.patchTotals", ApiTimeout,
-                    () => _api.PatchTotalsAsync(rid, norm.sub, norm.tax, norm.tip, norm.total, ct), IsTransientApi);
+                // Round nullable pieces
+                decimal? subRounded = subOpt is null ? null : Round2(subOpt.Value);
+                decimal? taxRounded = taxOpt is null ? null : Round2(taxOpt.Value);
+                decimal? tipRounded = tipOpt is null ? null : Round2(tipOpt.Value);
 
-                var needsReview = Math.Abs(delta) > allow && declaredTotal > 0m;
-                await RetryAsync("api.patchReview", ApiTimeout,
-                    () => _api.PatchReviewAsync(rid, delta, needsReview, ct), IsTransientApi);
+                await RetryAsync(
+                    op: "api.patchTotals",
+                    perAttemptTimeout: ApiTimeout,
+                    action: ct2 => _api.PatchTotalsAsync(rid, subRounded, taxRounded, tipRounded, totalRounded, ct2),
+                    isTransient: IsTransientApi,
+                    maxAttempts: 3,
+                    log: _log,
+                    outer: ct);
 
-                _log.Parsed(rid, parsed.Items.Count, norm.sub, norm.tax ?? 0m, norm.total);
-                if (needsReview) _log.NeedsReview(rid, "Delta exceeded threshold");
+                // 8) Flip out of PendingParse, then re-patch totals to trigger final reconcile
+                await RetryAsync(
+                    op: "api.patchStatus",
+                    perAttemptTimeout: ApiTimeout,
+                    action: ct2 => _api.PatchStatusAsync(rid, ReceiptStatus.Parsed.ToString(), ct2),
+                    isTransient: IsTransientApi,
+                    maxAttempts: 3,
+                    log: _log,
+                    outer: ct);
 
-                // 8) Final status
-                var final = parsed.Items.Count > 0
-                    ? (needsReview ? ReceiptStatus.ParsedNeedsReview : ReceiptStatus.Parsed)
-                    : ReceiptStatus.Parsed;
+                await RetryAsync(
+                    op: "api.patchTotals.final",
+                    perAttemptTimeout: ApiTimeout,
+                    action: ct2 => _api.PatchTotalsAsync(rid, subRounded, taxRounded, tipRounded, totalRounded, ct2),
+                    isTransient: IsTransientApi,
+                    maxAttempts: 3,
+                    log: _log,
+                    outer: ct);
 
-                await RetryAsync("api.patchStatus", ApiTimeout,
-                    () => _api.PatchStatusAsync(rid, final.ToString(), ct), IsTransientApi);
+                _log.Parsed(rid, parsed.Items.Count, subRounded ?? 0m, taxRounded ?? 0m, totalRounded);
             }
         }
         finally
@@ -180,49 +202,61 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
     }
 
     #region Helpers
-    private async Task<T> RetryAsync<T>(string op, TimeSpan perAttemptTimeout, Func<Task<T>> action, Func<Exception, bool> isTransient)
+    public static async Task<T> RetryAsync<T>(
+        string op,
+        TimeSpan perAttemptTimeout,
+        Func<CancellationToken, Task<T>> action,
+        Func<Exception, bool> isTransient,
+        int maxAttempts = 3,
+        ILogger? log = null,
+        CancellationToken outer = default)
     {
-        var sw = Stopwatch.StartNew();
-        var attempt = 0;
-        Exception? last = null;
-
-        while (attempt < MaxAttempts)
+        for (int attempt = 1; attempt <= maxAttempts; attempt++)
         {
-            attempt++;
+            using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(outer);
+            attemptCts.CancelAfter(perAttemptTimeout);
+
             try
             {
-                var result = await action().WaitAsync(perAttemptTimeout);
-                if (attempt > 1) _log.LogInformation("{Op} succeeded on attempt {Attempt} after {Elapsed}ms", op, attempt, sw.ElapsedMilliseconds);
+                log?.LogInformation("{Op}: attempt {Attempt}/{Max} (timeout {Timeout}ms)", op, attempt, maxAttempts, perAttemptTimeout.TotalMilliseconds);
+                var result = await action(attemptCts.Token);
                 return result;
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            catch (Exception ex) when (attempt < maxAttempts && isTransient(ex))
             {
-                last = ex;
-                if (attempt >= MaxAttempts || !isTransient(ex))
+                log?.LogWarning(ex, "{Op}: transient failure on attempt {Attempt}; retrying…", op, attempt);
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), outer);
+                continue;
+            }
+            catch (OperationCanceledException oce) when (attemptCts.IsCancellationRequested && !outer.IsCancellationRequested)
+            {
+                if (attempt < maxAttempts)
                 {
-                    _log.LogError(ex, "{Op} failed on attempt {Attempt}/{Max}. Elapsed {Elapsed}ms", op, attempt, MaxAttempts, sw.ElapsedMilliseconds);
-                    throw;
+                    log?.LogWarning("{Op}: attempt {Attempt} timed out after {Timeout}ms; retrying…", op, attempt, perAttemptTimeout.TotalMilliseconds);
+                    continue;
                 }
-
-                var delay = JitterDelay(attempt);
-                _log.LogWarning(ex, "{Op} transient error on attempt {Attempt}. Retrying in {Delay}ms…", op, attempt, (int)delay.TotalMilliseconds);
-                await Task.Delay(delay);
+                throw new TimeoutException($"Operation '{op}' timed out after {perAttemptTimeout} (attempt {attempt}).", oce);
             }
         }
-
-        throw new InvalidOperationException("RetryAsync<T> should not reach here.", last);
+        throw new TimeoutException($"Operation '{op}' exhausted retries.");
     }
 
-    private async Task RetryAsync(string op, TimeSpan perAttemptTimeout, Func<Task> action, Func<Exception, bool> isTransient)
-        => await RetryAsync<object?>(op, perAttemptTimeout, async () => { await action(); return null; }, isTransient);
-
-    private static TimeSpan JitterDelay(int attempt)
-    {
-        var max = (int)(BaseDelay.TotalMilliseconds * Math.Pow(2, attempt));
-        var min = max / 2;
-        var ms = Random.Shared.Next(min, Math.Max(min + 1, max));
-        return TimeSpan.FromMilliseconds(ms);
-    }
+    private Task RetryAsync(
+        string op,
+        TimeSpan perAttemptTimeout,
+        Func<CancellationToken, Task> action,
+        Func<Exception, bool> isTransient,
+        int maxAttempts = 3,
+        ILogger? log = null,
+        CancellationToken outer = default)
+        => RetryAsync<object?>(
+            op,
+            perAttemptTimeout,
+            async ct2 => { await action(ct2); return null; },
+            isTransient,
+            maxAttempts,
+            log,
+            outer);
 
     private static bool IsTransientBlob(Exception ex)
         => ex is RequestFailedException rfe && (rfe.Status >= 500 || rfe.Status == 408 || rfe.Status == 429);
@@ -232,6 +266,5 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
     private static bool IsTransientApi(Exception ex)
         => (ex is RequestFailedException rfe && (rfe.Status >= 500 || rfe.Status == 408 || rfe.Status == 429))
            || ex is HttpRequestException;
-
     #endregion
 }
