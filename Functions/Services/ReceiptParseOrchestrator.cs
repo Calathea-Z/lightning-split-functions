@@ -103,17 +103,31 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 // 2) Preprocess
                 await using var pre = await _imagePrep.PrepareAsync(original, ct);
 
-                // 3) OCR
+                // 2.1) Buffer preprocessed image to bytes so each retry gets a fresh stream
+                byte[] preBytes;
+                {
+                    if (pre.CanSeek) pre.Position = 0;
+                    using var ms = new MemoryStream();
+                    await pre.CopyToAsync(ms, 81920, ct);
+                    preBytes = ms.ToArray();
+                }
+
+                // 3) OCR (each retry uses a NEW MemoryStream over the same bytes)
                 _log.OcrRequested(rid, _ocr.GetType().Name);
                 var rawText = await RetryAsync<string?>(
                     op: "ocr.read",
                     perAttemptTimeout: OcrTimeout,
-                    action: ct2 => _ocr.ReadAsync(pre, ct2),
+                    action: ct2 =>
+                    {
+                        // fresh, non-disposed stream per attempt
+                        var fresh = new MemoryStream(preBytes, writable: false);
+                        return _ocr.ReadAsync(fresh, ct2);
+                    },
                     isTransient: IsTransientOcr,
                     maxAttempts: 3,
                     log: _log,
-                    outer: ct);
-
+                    outer: ct
+                );
                 if (string.IsNullOrWhiteSpace(rawText))
                     _log.LogWarning("OCR returned empty text");
 
