@@ -31,7 +31,7 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
 
     public Task PostItemAsync(Guid id, object dto, CancellationToken ct) =>
         Send(c => c.PostAsJsonAsync($"/api/receipts/{id}/items", dto, JsonOpts, ct),
-             "POST", $"/api/receipts/{id}/items", id, ct, throwOnError: false);
+             "POST", $"/api/receipts/{id}/items", id, ct, throwOnError: false, allowRetry: false);
 
     public async Task PostParseErrorAsync(Guid receiptId, string note, CancellationToken ct)
     {
@@ -55,7 +55,7 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
     private async Task PatchOrThrow(string path, object dto, CancellationToken ct)
     {
         using var resp = await Send(c => c.PatchAsJsonAsync(path, dto, JsonOpts, ct),
-                                    "PATCH", path, Guid.Empty, ct, throwOnError: true);
+                                    "PATCH", path, Guid.Empty, ct, throwOnError: true, allowRetry: true);
     }
 
     private static readonly TimeSpan[] Backoff = {
@@ -72,27 +72,28 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
         string path,
         Guid rid,
         CancellationToken ct,
-        bool throwOnError)
+        bool throwOnError,
+        bool allowRetry = true)
     {
         HttpResponseMessage? last = null;
 
-        for (int i = 0; i <= Backoff.Length; i++)
+        for (int i = 0; i <= (allowRetry ? Backoff.Length : 0); i++)
         {
             try
             {
                 last = await call(New());
-                if ((int)last.StatusCode < 400 || !IsTransient((int)last.StatusCode)) break;
+                if ((int)last.StatusCode < 400 || !IsTransient((int)last.StatusCode) || !allowRetry) break;
 
                 log.LogWarning("{Op} transient {Status} for {Path} rid={Rid} attempt={Attempt}",
                     op, (int)last.StatusCode, path, rid, i + 1);
             }
-            catch (HttpRequestException ex) when (i < Backoff.Length)
+            catch (HttpRequestException ex) when (i < Backoff.Length && allowRetry)
             {
                 log.LogWarning(ex, "{Op} network error for {Path} rid={Rid} attempt={Attempt}",
                     op, path, rid, i + 1);
             }
 
-            if (i < Backoff.Length) await Task.Delay(Backoff[i], ct);
+            if (i < Backoff.Length && allowRetry) await Task.Delay(Backoff[i], ct);
         }
 
         if (last is null) throw new InvalidOperationException("No response from HTTP call.");

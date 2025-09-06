@@ -33,7 +33,7 @@ public sealed class OcrSpaceOcr : IReceiptOcr
     {
         if (image is null) throw new ArgumentNullException(nameof(image));
 
-        await using var ms = await BufferStreamAsync(image, MaxBufferBytes, ct);
+        using var ms = await BufferStreamAsync(image, MaxBufferBytes, ct);
         _logger.LogInformation("OCR upload buffered: {Bytes} bytes", ms.Length);
 
         try

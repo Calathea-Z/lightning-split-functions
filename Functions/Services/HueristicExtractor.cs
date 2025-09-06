@@ -1,41 +1,45 @@
 ﻿// Functions/Services/HeuristicExtractor.cs
-using Functions.Helpers;
-using System.Text.RegularExpressions;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
-using Functions.Contracts.HueristicExtractor;
+using System.Text.RegularExpressions;
+using Functions.Contracts.HeuristicExtractor;
 
 namespace Functions.Services
 {
-
     public static class HeuristicExtractor
     {
-        // -------- Patterns --------
+        // -------- Patterns (loosened to allow 1+ decimals, optional decimals) --------
+        private static readonly string MoneyNumber = @"-?\d{1,6}(?:[.,]\d{1,4})?"; // supports 0–4 decimals
+        private static readonly string MoneyToken = $@"\$?\s*{MoneyNumber}";
+
         private static readonly Regex MoneyOnly = new(
-            @"^\s*\$?\s*-?\d{1,6}(?:[.,]\d{2})\s*$",
+            $@"^\s*{MoneyToken}\s*$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex InlineMoney = new(
-            @"\$?\s*-?\d{1,6}(?:[.,]\d{2})",
+            MoneyToken,
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex PriceAtEnd = new(
-            @"^(?<desc>.+?)\s+(?<price>\$?\s*\d{1,6}(?:[.,]\d{2})?)$",
+            $@"^(?<desc>.+?)\s+(?<price>{MoneyToken})$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex UnitThenTotal = new(
-            @"^(?<desc>.+?)\s+(?<unit>\$?\s*\d{1,6}(?:[.,]\d{2})?)\s+(?<total>\$?\s*\d{1,6}(?:[.,]\d{2})?)$",
+            $@"^(?<desc>.+?)\s+(?<unit>{MoneyToken})\s+(?<total>{MoneyToken})$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex UnitThenNoTotal = new(
-            @"^(?<desc>.+?)\s+(?<unit>\$?\s*\d{1,6}(?:[.,]\d{2})?)$",
+            $@"^(?<desc>.+?)\s+(?<unit>{MoneyToken})$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex QtyTimesUnit = new(
-            @"^(?<desc>.+?)\s+(?<qty>\d{1,3})\s*[x×]\s*(?<unit>\$?\s*\d{1,6}(?:[.,]\d{2})?)$",
+            $@"^(?<desc>.+?)\s+(?<qty>\d{{1,3}})\s*[x×]\s*(?<unit>{MoneyToken})$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         private static readonly Regex LeadingQtyThenUnit = new(
-            @"^(?<qty>\d{1,3})\s*[x×]\s*(?<desc>.+?)\s+\$?\s*(?<unit>\d{1,6}(?:[.,]\d{2})?)$",
+            $@"^(?<qty>\d{{1,3}})\s*[x×]\s*(?<desc>.+?)\s+\$?\s*(?<unit>{MoneyNumber})$",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         // qty anywhere in the description (prefix OR suffix)
@@ -60,7 +64,6 @@ namespace Functions.Services
                 .ToList();
 
             // 0.5) Fix interleaved triples like: [desc-only][desc+unit][money-only]
-            // Example: Water / Muffin x2 $1.25 / $2.00  →  Water $1.25 / Muffin x2 / $2.00
             FixInterleavedTriples(rawLines);
 
             // 1) Pre-merge: attach money-only lines to the previous line (totals-aware + qty-guard)
@@ -234,7 +237,7 @@ namespace Functions.Services
                     .Select(g => g.First()).Take(40).ToList();
             }
 
-            // 4) Compute totals if missing
+            // 4) Compute totals if missing (all values already rounded in TryMoney)
             var sumItems = items.Sum(i => i.TotalPrice ?? (i.UnitPrice * i.Qty));
             if (subtotal is null && items.Count > 0) subtotal = Round2(sumItems);
             if (total is null && items.Count > 0) total = Round2(sumItems + (tax ?? 0m) + (tip ?? 0m));
@@ -263,17 +266,14 @@ namespace Functions.Services
 
                 if (!aHasPrice && m.Success && IsMoneyOnly(c))
                 {
-                    // Heuristic safety: 'a' must look like an item name
                     if (LooksLikeItemName(a))
                     {
                         var unitText = m.Groups["unit"].Value.Trim();
                         var descOnlyB = m.Groups["desc"].Value.Trim();
 
-                        // Move the unit to line A; strip from line B
                         lines[i] = $"{a} {unitText}";
                         lines[i + 1] = descOnlyB;
 
-                        // Advance i one step so we don't reprocess the just-modified B as a fresh triple
                         i++;
                     }
                 }
@@ -298,10 +298,8 @@ namespace Functions.Services
                 {
                     var prev = merged[^1].Trim();
 
-                    // Do not attach if previous contains a qty token; let item parser handle it
                     bool prevHasQty = QtyAnywhere.IsMatch(prev);
 
-                    // Guard: don't attach to totals-like or price-complete lines; only to itemish text
                     if (!prevHasQty && !TotalsLabel.IsMatch(prev) && !PriceAtEnd.IsMatch(prev) && LooksLikeItemName(prev))
                     {
                         merged[^1] = $"{prev} {line}";
@@ -324,7 +322,7 @@ namespace Functions.Services
             if (TotalsLabel.IsMatch(line))
             {
                 // Try in-line money
-                var m = Regex.Match(line, @"(\$?\s*-?\d{1,6}(?:[.,]\d{2}))\s*$", RegexOptions.IgnoreCase);
+                var m = Regex.Match(line, $@"({MoneyToken})\s*$", RegexOptions.IgnoreCase);
                 if (m.Success && TryMoney(m.Groups[1].Value, out val))
                 {
                     which = NormalizeTotalLabel(line);
@@ -421,14 +419,34 @@ namespace Functions.Services
         private static void TryPullTotal(string line, string keyPattern, ref decimal? target)
         {
             if (target is not null) return;
-            var rx = new Regex($@"^(?:{keyPattern})\b.*?(\$?\s*-?\d{{1,6}}(?:[.,]\d{{2}})?)$",
+            var rx = new Regex($@"^(?:{keyPattern})\b.*?({MoneyToken})$",
                                RegexOptions.IgnoreCase | RegexOptions.Compiled);
             var m = rx.Match(line);
             if (m.Success && TryMoney(m.Groups[1].Value, out var val))
                 target = val;
         }
 
-        private static bool TryMoney(string s, out decimal val) => Money.TryParse(s, out val);
+        // Liberal money parse + normalization → 2dp away-from-zero
+        private static readonly Regex MoneyExtract = new($@"{MoneyNumber}", RegexOptions.Compiled);
+        private static bool TryMoney(string s, out decimal val)
+        {
+            val = 0m;
+            if (string.IsNullOrWhiteSpace(s)) return false;
+
+            // find the number part (ignore $ and spaces)
+            var m = MoneyExtract.Match(s);
+            if (!m.Success) return false;
+
+            var raw = m.Value.Trim();
+            // normalize: remove thousands separators; force dot decimal
+            raw = raw.Replace(" ", "").Replace("$", "");
+            raw = raw.Replace(",", "."); // allow inputs like "1,23"
+            if (!decimal.TryParse(raw, NumberStyles.Number | NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var v))
+                return false;
+
+            val = Math.Round(v, 2, MidpointRounding.AwayFromZero);
+            return true;
+        }
 
         private static int GuessQty(decimal unit, decimal total)
         {
@@ -449,7 +467,6 @@ namespace Functions.Services
 
         private static bool NextNextIsTotals(IReadOnlyList<string> lines, int i)
         {
-            // true if there is a line i+2 and it's a totals label
             return (i + 2 < lines.Count) && TotalsLabel.IsMatch(lines[i + 2].Trim());
         }
 
@@ -463,11 +480,11 @@ namespace Functions.Services
                 if (NormalizeTotalLabel(line) == "subtotal")
                 {
                     // same-line number?
-                    var m = Regex.Match(line, @"(\$?\s*-?\d{1,6}(?:[.,]\d{2}))\s*$", RegexOptions.IgnoreCase);
-                    if (m.Success && Money.TryParse(m.Groups[1].Value, out var v)) return v;
+                    var m = Regex.Match(line, $@"({MoneyToken})\s*$", RegexOptions.IgnoreCase);
+                    if (m.Success && TryMoney(m.Groups[1].Value, out var v)) return v;
 
                     // next-line money-only?
-                    if (i + 1 < lines.Count && IsMoneyOnly(lines[i + 1]) && Money.TryParse(lines[i + 1], out var v2)) return v2;
+                    if (i + 1 < lines.Count && IsMoneyOnly(lines[i + 1]) && TryMoney(lines[i + 1], out var v2)) return v2;
                 }
             }
             return null;
@@ -482,7 +499,6 @@ namespace Functions.Services
         private static decimal Round2(decimal d) => Math.Round(d, 2, MidpointRounding.AwayFromZero);
 
         // --- Tiny helpers ---
-
         private static bool LooksLikeItemName(string s)
         {
             var t = s.Trim();

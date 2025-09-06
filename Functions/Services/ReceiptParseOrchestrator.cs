@@ -236,11 +236,16 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 var result = await action(attemptCts.Token);
                 return result;
             }
-            catch (Exception ex) when (attempt < maxAttempts && isTransient(ex))
+            catch (Exception ex) when (isTransient(ex))
             {
-                log?.LogWarning(ex, "{Op}: transient failure on attempt {Attempt}; retrying…", op, attempt);
-                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), outer);
-                continue;
+                if (attempt < maxAttempts)
+                {
+                    log?.LogWarning(ex, "{Op}: transient failure on attempt {Attempt}; retrying…", op, attempt);
+                    await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt), outer);
+                    continue;
+                }
+                // On final attempt, wrap transient exceptions in TimeoutException
+                throw new TimeoutException($"Operation '{op}' exhausted retries after {maxAttempts} attempts.", ex);
             }
             catch (OperationCanceledException oce) when (attemptCts.IsCancellationRequested && !outer.IsCancellationRequested)
             {
@@ -252,6 +257,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 throw new TimeoutException($"Operation '{op}' timed out after {perAttemptTimeout} (attempt {attempt}).", oce);
             }
         }
+        // This should never be reached due to the catch block above
         throw new TimeoutException($"Operation '{op}' exhausted retries.");
     }
 
