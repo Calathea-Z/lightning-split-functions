@@ -19,8 +19,6 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
         return c;
     }
 
-    /* ---------- NuGet DTO-based methods ---------- */
-
     public Task PostItemAsync(Guid id, CreateReceiptItemRequest request, CancellationToken ct = default) =>
         Send(c => c.PostAsJsonAsync($"/api/receipts/{id:D}/items", request, JsonOpts, ct),
              "POST", $"/api/receipts/{id:D}/items", id, ct,
@@ -39,8 +37,44 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
     public Task PatchParseMetaAsync(Guid id, UpdateParseMetaRequest request, CancellationToken ct = default) =>
         PatchOrThrow($"/api/receipts/{id:D}/parse-meta", request, ct);
 
-    /* ---------- Private ---------- */
+    public async Task PostParseErrorAsync(Guid receiptId, string note, CancellationToken ct = default)
+    {
+        // 1) Best-effort: set status to FailedParse
+        try
+        {
+            await PatchStatusAsync(receiptId, new UpdateStatusRequest(ReceiptStatus.FailedParse), ct);
+        }
+        catch (InvalidOperationException ex)
+        {
+            // Match your previous behavior: don't explode on 404
+            if (ex.Message.Contains(" 404:"))
+            {
+                log.LogInformation("Receipt {ReceiptId} not found when marking FailedParse.", receiptId);
+                return;
+            }
+            throw;
+        }
 
+        // 2) Attach reject reason to parse-meta (non-fatal if it fails)
+        try
+        {
+            var meta = new UpdateParseMetaRequest(
+                ParsedBy: ParseEngine.Heuristics,   // source unknown; heuristics is a safe default
+                LlmAttempted: false,
+                LlmAccepted: null,
+                LlmModel: null,
+                ParserVersion: null,
+                RejectReason: note);
+
+            await PatchParseMetaAsync(receiptId, meta, ct);
+        }
+        catch (Exception ex)
+        {
+            log.LogWarning(ex, "Failed to patch parse-meta reject reason for {ReceiptId}", receiptId);
+        }
+    }
+
+    #region Helpers 
     private async Task PatchOrThrow(string path, object dto, CancellationToken ct)
     {
         using var _ = await Send(c => c.PatchAsJsonAsync(path, dto, JsonOpts, ct),
@@ -112,4 +146,6 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
         if (string.IsNullOrEmpty(s)) return string.Empty;
         return s.Length <= max ? s : s.Substring(0, max);
     }
+
+    #endregion
 }

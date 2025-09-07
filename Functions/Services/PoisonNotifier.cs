@@ -9,7 +9,7 @@ public sealed class PoisonNotifier(IReceiptApiClient _api, ILogger<PoisonNotifie
     {
         try
         {
-            await _api.PostParseErrorAsync(receiptId, note, ct); // add this to your API client
+            await _api.PostParseErrorAsync(receiptId, note, ct); 
             _log.LogWarning("Marked receipt {ReceiptId} as FailedParse from poison queue.", receiptId);
         }
         catch (HttpRequestException ex)

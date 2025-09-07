@@ -9,11 +9,10 @@ using Functions.Infrastructure.Logging;
 using Functions.Infrastructure.Resilience;
 using Functions.Services.Abstractions;
 using Functions.Validation;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-// alias for brevity
-using ParseEngine = Api.Abstractions.Receipts.ParseEngine;
 
 namespace Functions.Services;
 
@@ -25,6 +24,8 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
     private readonly IImagePreprocessor _imagePrep;
     private readonly IReceiptApiClient _api;
     private readonly IReceiptNormalizer _normalizer;
+    private readonly IConfiguration _cfg;
+    private readonly string _llmModelTag;
 
     public ReceiptParseOrchestrator(
         ILogger<IReceiptParseOrchestrator> log,
@@ -32,7 +33,8 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
         IReceiptOcr ocr,
         IImagePreprocessor imagePrep,
         IReceiptApiClient api,
-        IReceiptNormalizer normalizer)
+        IReceiptNormalizer normalizer,
+        IConfiguration cfg)
     {
         _log = log;
         _blobSvc = blobSvc;
@@ -40,6 +42,14 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
         _imagePrep = imagePrep;
         _api = api;
         _normalizer = normalizer;
+        _cfg = cfg;
+
+        _llmModelTag =
+            _cfg["AOAI_DEPLOYMENT"] ??
+            _cfg["Values:AOAI_DEPLOYMENT"] ??
+            Environment.GetEnvironmentVariable("AOAI_DEPLOYMENT") ??
+            Environment.GetEnvironmentVariable("Values:AOAI_DEPLOYMENT") ??
+            "unknown";
     }
 
     private const long MaxBlobBytes = 50L * 1024 * 1024; // 50 MB
@@ -55,6 +65,10 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
     {
         PropertyNameCaseInsensitive = true
     };
+
+    private static readonly string ParserVersionTag =
+    typeof(ReceiptParseOrchestrator).Assembly.GetName().Version?.ToString() ?? "unknown";
+
 
     public async Task RunAsync(ReceiptParseMessage req, CancellationToken ct)
     {
@@ -162,8 +176,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     _log.NeedsReview(rid, "Weak heuristic extraction");
 
                 bool llmAttempted = false;
-                bool? llmAccepted = null;
-                string? llmModel = null;
 
                 // 6) Decide: heuristics strong? If yes, skip LLM and finish fast
                 if (IsHeuristicsStrong(heur, out var strongReason))
@@ -233,21 +245,21 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
 
                     await Retry.RetryAsync(
                          op: "api.patchParseMeta.heuristics",
-                         perAttemptTimeout: ApiTimeout,
-                         action: ct2 => _api.PatchParseMetaAsync(
-                             rid,
-                             new UpdateParseMetaRequest(
+                        perAttemptTimeout: ApiTimeout,
+                        action: ct2 => _api.PatchParseMetaAsync(
+                            rid,
+                            new UpdateParseMetaRequest(
                                  ParsedBy: ParseEngine.Heuristics,
                                  LlmAttempted: llmAttempted,
-                                 LlmAccepted: llmAccepted,
-                                 LlmModel: llmModel,
-                                 ParserVersion: null,
+                                 LlmAccepted: null,
+                                 LlmModel: null,
+                                 ParserVersion: ParserVersionTag,
                                  RejectReason: strongReason),
-                             ct2),
-                         isTransient: IsTransientApi,
-                         maxAttempts: 3,
-                         log: _log,
-                         outer: ct);
+                            ct2),
+                        isTransient: IsTransientApi,
+                        maxAttempts: 3,
+                        log: _log,
+                        outer: ct);
 
                     _log.Parsed(rid, posted, subRounded ?? 0m, taxRounded ?? 0m, totalRounded);
                     return; // done
@@ -317,7 +329,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
 
                 if (valid && parsed is not null)
                 {
-                    llmAccepted = true;
 
                     // LLM path
                     foreach (var it in parsed.Items)
@@ -386,10 +397,10 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                             rid,
                             new UpdateParseMetaRequest(
                                 ParsedBy: ParseEngine.Llm,
-                                LlmAttempted: llmAttempted,
-                                LlmAccepted: llmAccepted,
-                                LlmModel: llmModel,
-                                ParserVersion: null,
+                                LlmAttempted: true,
+                                LlmAccepted: true,
+                                LlmModel: _llmModelTag,
+                                ParserVersion: ParserVersionTag,
                                 RejectReason: null),
                             ct2),
                         isTransient: IsTransientApi,
@@ -401,7 +412,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 }
                 else
                 {
-                    llmAccepted = false;
 
                     // Fallback: heuristics (keep status = ParsedNeedsReview)
                     foreach (var it in heur.Items)
@@ -461,10 +471,10 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                             rid,
                             new UpdateParseMetaRequest(
                                 ParsedBy: ParseEngine.Heuristics,
-                                LlmAttempted: llmAttempted,
-                                LlmAccepted: llmAccepted,
-                                LlmModel: llmModel,
-                                ParserVersion: null,
+                                LlmAttempted: true,
+                                LlmAccepted: false,
+                                LlmModel: _llmModelTag,
+                                ParserVersion: ParserVersionTag,
                                 RejectReason: llmReason ?? "llm_rejected_or_invalid"),
                             ct2),
                         isTransient: IsTransientApi,
