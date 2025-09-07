@@ -3,7 +3,7 @@ using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
-using Functions.Services;
+using Functions.Infrastructure.Resilience;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -27,18 +27,18 @@ public class RetryPolicyTests
         var maxAttempts = 3;
         var perAttemptTimeout = TimeSpan.FromSeconds(1);
 
-        Func<CancellationToken, Task<string>> action = async (ct) =>
+        Func<CancellationToken, Task<string>> action = (ct) =>
         {
             attemptCount++;
             if (attemptCount < maxAttempts)
                 throw new HttpRequestException("Transient error");
-            return "success";
+            return Task.FromResult("success");
         };
 
         Func<Exception, bool> isTransient = ex => ex is HttpRequestException;
 
         // Act
-        var result = await ReceiptParseOrchestrator.RetryAsync(
+        var result = await Retry.RetryAsync(
             "test.operation",
             perAttemptTimeout,
             action,
@@ -60,7 +60,7 @@ public class RetryPolicyTests
         var maxAttempts = 3;
         var perAttemptTimeout = TimeSpan.FromSeconds(1);
 
-        Func<CancellationToken, Task<string>> action = async (ct) =>
+        Func<CancellationToken, Task<string>> action = (ct) =>
         {
             attemptCount++;
             throw new InvalidOperationException("Non-transient error");
@@ -71,7 +71,7 @@ public class RetryPolicyTests
         // Act & Assert
         await Assert.ThrowsAsync<InvalidOperationException>(async () =>
         {
-            await ReceiptParseOrchestrator.RetryAsync(
+            await Retry.RetryAsync(
                 "test.operation",
                 perAttemptTimeout,
                 action,
@@ -104,7 +104,7 @@ public class RetryPolicyTests
         // Act & Assert
         await Assert.ThrowsAsync<TimeoutException>(async () =>
         {
-            await ReceiptParseOrchestrator.RetryAsync(
+            await Retry.RetryAsync(
                 "test.operation",
                 perAttemptTimeout,
                 action,
@@ -139,7 +139,7 @@ public class RetryPolicyTests
         // Act & Assert
         var exception = await Assert.ThrowsAnyAsync<OperationCanceledException>(async () =>
         {
-            await ReceiptParseOrchestrator.RetryAsync(
+            await Retry.RetryAsync(
                 "test.operation",
                 perAttemptTimeout,
                 action,
@@ -163,16 +163,16 @@ public class RetryPolicyTests
         var maxAttempts = 3;
         var perAttemptTimeout = TimeSpan.FromSeconds(1);
 
-        Func<CancellationToken, Task<string>> action = async (ct) =>
+        Func<CancellationToken, Task<string>> action = (ct) =>
         {
             attemptCount++;
-            return "success";
+            return Task.FromResult("success");
         };
 
         Func<Exception, bool> isTransient = ex => false;
 
         // Act
-        var result = await ReceiptParseOrchestrator.RetryAsync(
+        var result = await Retry.RetryAsync(
             "test.operation",
             perAttemptTimeout,
             action,
@@ -194,7 +194,7 @@ public class RetryPolicyTests
         var maxAttempts = 2;
         var perAttemptTimeout = TimeSpan.FromMilliseconds(100);
 
-        Func<CancellationToken, Task<string>> action = async (ct) =>
+        Func<CancellationToken, Task<string>> action = (ct) =>
         {
             attemptCount++;
             throw new HttpRequestException("Transient error");
@@ -205,7 +205,7 @@ public class RetryPolicyTests
         // Act & Assert
         await Assert.ThrowsAsync<TimeoutException>(async () =>
         {
-            await ReceiptParseOrchestrator.RetryAsync(
+            await Retry.RetryAsync(
                 "test.operation",
                 perAttemptTimeout,
                 action,

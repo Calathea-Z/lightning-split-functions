@@ -26,6 +26,7 @@ public class ReceiptParseOrchestratorTests
     private readonly Mock<IReceiptOcr> _mockOcr;
     private readonly Mock<IImagePreprocessor> _mockImagePreprocessor;
     private readonly Mock<IReceiptApiClient> _mockApiClient;
+    private readonly Mock<IReceiptNormalizer> _mockNormalizer;
     private readonly Mock<BlobContainerClient> _mockLockContainer;
     private readonly Mock<BlobClient> _mockLockBlob;
     private readonly Mock<BlobContainerClient> _mockReceiptContainer;
@@ -38,6 +39,7 @@ public class ReceiptParseOrchestratorTests
         _mockOcr = new Mock<IReceiptOcr>();
         _mockImagePreprocessor = new Mock<IImagePreprocessor>();
         _mockApiClient = new Mock<IReceiptApiClient>();
+        _mockNormalizer = new Mock<IReceiptNormalizer>();
         _mockLockContainer = new Mock<BlobContainerClient>();
         _mockLockBlob = new Mock<BlobClient>();
         _mockReceiptContainer = new Mock<BlobContainerClient>();
@@ -83,7 +85,8 @@ public class ReceiptParseOrchestratorTests
             _mockBlobServiceClient.Object,
             _mockOcr.Object,
             _mockImagePreprocessor.Object,
-            _mockApiClient.Object);
+            _mockApiClient.Object,
+            _mockNormalizer.Object);
 
     private static ReceiptParseMessage CreateTestMessage() =>
         new("receipts", "test-receipt.jpg", Guid.NewGuid().ToString());
@@ -117,7 +120,7 @@ public class ReceiptParseOrchestratorTests
             .ReturnsAsync(new MemoryStream(new byte[1024]));
 
         var sunnyMartText =
-            "Coffee $3.50\nSandwich $8.75\nCookie 2x $2.00\nSoda $2.50\nChips $1.50\nSubtotal: $19.25\nTax: $1.54\nTip: $2.00\nTotal: $22.79";
+            "Coffee $3.50\nSandwich $8.75\nCookie 2x $2.00\nSoda $2.50\nChips $1.50\nSubtotal: $20.25\nTax: $1.54\nTip: $2.00\nTotal: $22.79";
         _mockOcr.Setup(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(sunnyMartText);
 
@@ -128,7 +131,7 @@ public class ReceiptParseOrchestratorTests
         _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()))
             .Callback<Guid, object, CancellationToken>((_, item, _) => postedItems.Add(item))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, 19.25m, 1.54m, 2.00m, 22.79m, It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, 20.25m, 1.54m, 2.00m, 22.79m, It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
         _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
@@ -139,7 +142,7 @@ public class ReceiptParseOrchestratorTests
         // Assert
         _mockApiClient.Verify(x => x.PatchRawTextAsync(receiptId, sunnyMartText, It.IsAny<CancellationToken>()), Times.Once);
         _mockApiClient.Verify(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Exactly(5));
-        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, 19.25m, 1.54m, 2.00m, 22.79m, It.IsAny<CancellationToken>()), Times.AtLeastOnce());
+        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, 20.25m, 1.54m, 2.00m, 22.79m, It.IsAny<CancellationToken>()), Times.AtLeastOnce());
         _mockApiClient.Verify(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()), Times.Once);
         Assert.Equal(5, postedItems.Count);
 
@@ -573,7 +576,7 @@ public class ReceiptParseOrchestratorTests
             .Returns(Task.CompletedTask);
         _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, null, null, null, 0m, It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.ParsedNeedsReview.ToString(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
@@ -581,7 +584,7 @@ public class ReceiptParseOrchestratorTests
 
         // Assert
         _mockApiClient.Verify(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Never);
-        _mockApiClient.Verify(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()), Times.Once);
+        _mockApiClient.Verify(x => x.PatchStatusAsync(receiptId, ReceiptStatus.ParsedNeedsReview.ToString(), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
