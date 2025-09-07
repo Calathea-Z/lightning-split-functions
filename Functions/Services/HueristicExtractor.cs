@@ -51,6 +51,34 @@ namespace Functions.Services
             @"^(?<lab>subtotal|sub\s*total|total\s*amount|total|amount\s*due|sales\s*tax|tax|tip|gratuity|service|cash|change)\b",
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
+        // -------- Signed/discount detection helpers --------
+        private static readonly Regex MoneyTrailingMinus = new(
+            @"\b\$?\s*(?<num>\d{1,6}(?:[.,]\d{1,4})?)\s*(?:-|–|—)\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex MoneyLeadingMinus = new(
+            @"\b(?:-|–|—)\s*\$?\s*(?<num>\d{1,6}(?:[.,]\d{1,4})?)\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex MoneyParen = new(
+            @"\(\s*\$?\s*(?<num>\d{1,6}(?:[.,]\d{1,4})?)\s*\)",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex DiscountLike = new(
+            @"discount|promo|promotion|coupon|offer|save|spend|member|loyalty|rewards|bogo|%[\s-]*off|pre[-\s]?discount\s*subtotal|discount\s*total",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static bool IsNegativeMoneyToken(string s) =>
+            MoneyTrailingMinus.IsMatch(s) || MoneyLeadingMinus.IsMatch(s) || MoneyParen.IsMatch(s);
+
+        private static bool IsDiscountRow(string line)
+        {
+            // Any promo wording OR any negative money token means it's a discount/meta row
+            if (DiscountLike.IsMatch(line)) return true;
+            if (IsNegativeMoneyToken(line)) return true;
+            return false;
+        }
+
         // -------- Entry point --------
         public static ParsedReceiptList Extract(string? raw)
         {
@@ -83,6 +111,9 @@ namespace Functions.Services
             {
                 var line = lines[i];
 
+                // Skip any discount/meta-looking line before we do anything else
+                if (IsDiscountRow(line)) continue;
+
                 // Flip into totals mode as soon as any totals/settlement label appears
                 if (TotalsLabel.IsMatch(line)) inTotals = true;
 
@@ -108,37 +139,48 @@ namespace Functions.Services
                 // --- Item parsing (order matters) ---
                 if (TryMatch(LeadingQtyThenUnit, line, out var it0))
                 {
+                    // Guard negative unit/total (should never post as item)
+                    if ((it0!.TotalPrice ?? (it0.UnitPrice * it0.Qty)) < 0m) continue;
+
                     items.Add(it0!);
                     runningItemsSum = Round2(runningItemsSum + (it0!.TotalPrice ?? (it0.UnitPrice * it0.Qty)));
                     continue;
                 }
                 if (TryMatch(UnitThenTotal, line, out var it1))
                 {
+                    if ((it1!.TotalPrice ?? (it1.UnitPrice * it1.Qty)) < 0m) continue;
+
                     items.Add(it1!);
                     runningItemsSum = Round2(runningItemsSum + (it1!.TotalPrice ?? (it1.UnitPrice * it1.Qty)));
                     continue;
                 }
                 if (TryTwoLineUnitTotal(lines, i, out var it1b))
                 {
+                    if ((it1b!.TotalPrice ?? (it1b.UnitPrice * it1b.Qty)) < 0m) { i++; continue; }
+
                     items.Add(it1b!);
                     runningItemsSum = Round2(runningItemsSum + (it1b!.TotalPrice ?? (it1b.UnitPrice * it1b.Qty)));
                     i++; continue;
                 }
                 if (TryMatch(QtyTimesUnit, line, out var it2))
                 {
+                    if ((it2!.TotalPrice ?? (it2.UnitPrice * it2.Qty)) < 0m) continue;
+
                     items.Add(it2!);
                     runningItemsSum = Round2(runningItemsSum + (it2!.TotalPrice ?? (it2.UnitPrice * it2.Qty)));
                     continue;
                 }
                 if (TryMatch(PriceAtEnd, line, out var it3))
                 {
+                    if ((it3!.TotalPrice ?? (it3.UnitPrice * it3.Qty)) < 0m) continue;
+
                     items.Add(it3!);
                     runningItemsSum = Round2(runningItemsSum + (it3!.TotalPrice ?? (it3.UnitPrice * it3.Qty)));
                     continue;
                 }
 
                 // Bare description followed by money-only next line (ambiguous: could be UNIT or TOTAL)
-                if (i + 1 < lines.Count && !TotalsLabel.IsMatch(line) && IsMoneyOnly(lines[i + 1]))
+                if (i + 1 < lines.Count && !TotalsLabel.IsMatch(line) && IsMoneyOnly(lines[i + 1]) && !IsNegativeMoneyToken(lines[i + 1]))
                 {
                     if (TryMoney(lines[i + 1], out var money))
                     {
@@ -225,11 +267,14 @@ namespace Functions.Services
                 foreach (var line in lines)
                 {
                     if (TotalsLabel.IsMatch(line)) continue;
+                    if (IsDiscountRow(line)) continue;
+
                     var m = PriceAtEnd.Match(line);
                     if (!m.Success) continue;
                     var desc = Clean(StripQtyPrefix(m.Groups["desc"].Value));
                     if (desc.Length < 2) continue;
                     if (!TryMoney(m.Groups["price"].Value, out var p)) continue;
+                    if (p < 0m) continue; // never emit negative items
                     items.Add(new ItemHint(desc, 1, p, p));
                 }
                 items = items
@@ -264,7 +309,7 @@ namespace Functions.Services
                 bool aHasPrice = InlineMoney.IsMatch(a);
                 var m = UnitThenNoTotal.Match(b);
 
-                if (!aHasPrice && m.Success && IsMoneyOnly(c))
+                if (!aHasPrice && m.Success && IsMoneyOnly(c) && !IsNegativeMoneyToken(c))
                 {
                     if (LooksLikeItemName(a))
                     {
@@ -282,6 +327,7 @@ namespace Functions.Services
 
         // Totals-aware merge: only attach money-only to plausible item names and only before totals
         // NEVER attach to a previous line that contains a qty token (e.g., "2x", "x2", "×2")
+        // Also: NEVER merge negative money-only (discount/promo) lines.
         private static List<string> MergeMoneyOnlyLines(List<string> src)
         {
             var merged = new List<string>(src.Count);
@@ -294,13 +340,13 @@ namespace Functions.Services
                 if (TotalsLabel.IsMatch(line))
                     inTotals = true;
 
-                if (!inTotals && merged.Count > 0 && IsMoneyOnly(line))
+                if (!inTotals && merged.Count > 0 && IsMoneyOnly(line) && !IsNegativeMoneyToken(line))
                 {
                     var prev = merged[^1].Trim();
 
                     bool prevHasQty = QtyAnywhere.IsMatch(prev);
 
-                    if (!prevHasQty && !TotalsLabel.IsMatch(prev) && !PriceAtEnd.IsMatch(prev) && LooksLikeItemName(prev))
+                    if (!prevHasQty && !TotalsLabel.IsMatch(prev) && !PriceAtEnd.IsMatch(prev) && LooksLikeItemName(prev) && !IsDiscountRow(prev))
                     {
                         merged[^1] = $"{prev} {line}";
                         continue;
@@ -359,7 +405,7 @@ namespace Functions.Services
             var m = UnitThenNoTotal.Match(line);
             if (!m.Success) return false;
 
-            if (i + 1 < lines.Count && IsMoneyOnly(lines[i + 1]) &&
+            if (i + 1 < lines.Count && IsMoneyOnly(lines[i + 1]) && !IsNegativeMoneyToken(lines[i + 1]) &&
                 TryMoney(m.Groups["unit"].Value, out var unit) &&
                 TryMoney(lines[i + 1], out var tot))
             {
@@ -381,13 +427,14 @@ namespace Functions.Services
             {
                 var desc = Clean(StripQtyPrefix(m.Groups["desc"].Value));
                 if (TryMoney(m.Groups["price"].Value, out var price))
-                    item = new ItemHint(desc, 1, price, price);
+                    item = price < 0m ? null : new ItemHint(desc, 1, price, price);
             }
             else if (rx == UnitThenTotal)
             {
                 var desc = Clean(m.Groups["desc"].Value);
                 if (TryMoney(m.Groups["unit"].Value, out var unit) &&
-                    TryMoney(m.Groups["total"].Value, out var tot))
+                    TryMoney(m.Groups["total"].Value, out var tot) &&
+                    tot >= 0m)
                 {
                     var qty = GuessQty(unit, tot);
                     item = new ItemHint(desc, qty, unit, tot);
@@ -400,7 +447,8 @@ namespace Functions.Services
                     TryMoney(m.Groups["unit"].Value, out var unit))
                 {
                     var tot = Round2(qty * unit);
-                    item = new ItemHint(desc, qty, unit, tot);
+                    if (tot >= 0m)
+                        item = new ItemHint(desc, qty, unit, tot);
                 }
             }
             else // LeadingQtyThenUnit
@@ -410,7 +458,8 @@ namespace Functions.Services
                     TryMoney(m.Groups["unit"].Value, out var unit))
                 {
                     var tot = Round2(qty * unit);
-                    item = new ItemHint(desc, qty, unit, tot);
+                    if (tot >= 0m)
+                        item = new ItemHint(desc, qty, unit, tot);
                 }
             }
             return item is not null;
@@ -426,26 +475,49 @@ namespace Functions.Services
                 target = val;
         }
 
-        // Liberal money parse + normalization → 2dp away-from-zero
+        // Liberal signed money parse + normalization → 2dp away-from-zero
         private static readonly Regex MoneyExtract = new($@"{MoneyNumber}", RegexOptions.Compiled);
         private static bool TryMoney(string s, out decimal val)
         {
             val = 0m;
             if (string.IsNullOrWhiteSpace(s)) return false;
 
-            // find the number part (ignore $ and spaces)
+            // 1) Parentheses => negative
+            var mp = MoneyParen.Match(s);
+            if (mp.Success && TryParseDec(mp.Groups["num"].Value, out val))
+            {
+                val = -Round2(val);
+                return true;
+            }
+
+            // 2) Trailing minus => negative
+            var mt = MoneyTrailingMinus.Match(s);
+            if (mt.Success && TryParseDec(mt.Groups["num"].Value, out val))
+            {
+                val = -Round2(val);
+                return true;
+            }
+
+            // 3) Leading minus or plain number
             var m = MoneyExtract.Match(s);
             if (!m.Success) return false;
 
-            var raw = m.Value.Trim();
-            // normalize: remove thousands separators; force dot decimal
-            raw = raw.Replace(" ", "").Replace("$", "");
-            raw = raw.Replace(",", "."); // allow inputs like "1,23"
-            if (!decimal.TryParse(raw, NumberStyles.Number | NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var v))
-                return false;
+            if (!TryParseDec(m.Value, out var v)) return false;
 
-            val = Math.Round(v, 2, MidpointRounding.AwayFromZero);
+            val = Round2(v);
             return true;
+
+            static bool TryParseDec(string raw, out decimal v)
+            {
+                raw = raw.Trim();
+                raw = raw.Replace(" ", "").Replace("$", "");
+                // If input uses comma as decimal, convert to '.' (we already trimmed thousands)
+                // Heuristic: if there is both ',' and '.', assume '.' is decimal, else swap ',' -> '.'
+                if (raw.Contains(',') && !raw.Contains('.'))
+                    raw = raw.Replace(",", ".");
+                v = 0m;
+                return decimal.TryParse(raw, NumberStyles.Number | NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out v);
+            }
         }
 
         private static int GuessQty(decimal unit, decimal total)
@@ -503,6 +575,7 @@ namespace Functions.Services
         {
             var t = s.Trim();
             if (TotalsLabel.IsMatch(t)) return false;
+            if (IsDiscountRow(t)) return false;
             if (t.Length == 0) return false;
 
             bool hasLetters = t.Any(char.IsLetter);
