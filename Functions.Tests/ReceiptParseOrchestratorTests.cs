@@ -10,7 +10,7 @@ using Azure;
 using Azure.Core;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
-using Functions.Models;
+using Functions.Contracts.Messages;
 using Functions.Services;
 using Functions.Services.Abstractions;
 using Microsoft.Extensions.Logging;

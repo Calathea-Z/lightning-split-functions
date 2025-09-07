@@ -4,7 +4,7 @@ using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 
-namespace Functions.Dtos.Receipts
+namespace Functions.Contracts.Receipts
 {
     public sealed record CreateReceiptItemDto(
         string Label,

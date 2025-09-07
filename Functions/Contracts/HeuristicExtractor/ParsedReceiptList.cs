@@ -1,4 +1,4 @@
 ﻿namespace Functions.Contracts.HeuristicExtractor
 {
-    public sealed record ParsedReceipt(List<ParsedItem> Items, decimal? Subtotal, decimal? Tax, decimal? Tip, decimal? Total, bool IsSane);
+    public sealed record ParsedReceiptList(List<ItemHint> Items, decimal? Subtotal, decimal? Tax, decimal? Tip, decimal? Total, bool IsSane);
 }

@@ -6,11 +6,24 @@ using Microsoft.ApplicationInsights.Extensibility;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Azure.Functions.Worker.Builder;
 using Microsoft.Extensions.Azure;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 var builder = FunctionsApplication.CreateBuilder(args);
+
+/* ---------- Build a merged configuration (local.settings.json + UserSecrets + optional secrets.json + env) ---------- */
+var mergedConfig = new ConfigurationBuilder()
+    .AddConfiguration(builder.Configuration)                    // includes local.settings.json + env already
+    .AddUserSecrets<SecretsMarker>(optional: true)              // dotnet user-secrets for local dev (not checked in)
+    .AddJsonFile("secrets.json", optional: true, reloadOnChange: true) // optional local file (gitignored)
+    .AddJsonFile("secret.json", optional: true, reloadOnChange: true)  // support your current filename too
+    .AddEnvironmentVariables()                                  // Azure App Settings, etc.
+    .Build();
+
+// Make merged config available to the rest of the app via DI
+builder.Services.AddSingleton<IConfiguration>(mergedConfig);
 
 /* ---------- Logging: activity + scopes ---------- */
 builder.Logging.Configure(o =>
@@ -28,10 +41,10 @@ builder.Logging.AddSimpleConsole(o =>
     o.TimestampFormat = "HH:mm:ss ";
 });
 
-/* ---------- Config helper (supports root and "Values:" keys) ---------- */
+/* ---------- Config helper (supports root, "Values:", env) ---------- */
 string? GetCfg(string key) =>
-    builder.Configuration[key]
-    ?? builder.Configuration[$"Values:{key}"]
+    mergedConfig[key]
+    ?? mergedConfig[$"Values:{key}"]
     ?? Environment.GetEnvironmentVariable(key)
     ?? Environment.GetEnvironmentVariable($"Values:{key}");
 
@@ -49,7 +62,10 @@ builder.Services.AddHttpClient(); // default
 builder.Services
     .AddHttpClient("ocrspace", c => c.Timeout = TimeSpan.FromSeconds(60))
     .SetHandlerLifetime(TimeSpan.FromMinutes(5));
-// .AddPolicyHandler(RetryPolicies.GetHttpRetryPolicy()); // optional
+
+// Azure OpenAI (REST)
+builder.Services.AddHttpClient("aoai", c => { c.Timeout = TimeSpan.FromSeconds(30); });
+builder.Services.AddSingleton<IReceiptNormalizer, AoaiReceiptNormalizerHttp>();
 
 /* ---------- Application Insights (Functions isolated) ---------- */
 var aiConn = GetCfg("APPLICATIONINSIGHTS_CONNECTION_STRING")
@@ -74,7 +90,7 @@ builder.Services.ConfigureFunctionsApplicationInsights();
 
 /* ---------- Azure Storage Blobs DI ---------- */
 var storageConn = GetCfg("AzureWebJobsStorage")
-    ?? throw new InvalidOperationException("AzureWebJobsStorage is not configured. Set it in local.settings.json or environment.");
+    ?? throw new InvalidOperationException("AzureWebJobsStorage is not configured. Set it in local.settings.json, user-secrets, or environment.");
 
 builder.Services.AddAzureClients(az => az.AddBlobServiceClient(storageConn));
 
@@ -98,6 +114,7 @@ if (!Uri.TryCreate(apiBaseRaw, UriKind.Absolute, out var apiBase) ||
 
 /* ---------- Orchestrator ---------- */
 builder.Services.AddScoped<IReceiptParseOrchestrator, ReceiptParseOrchestrator>();
+builder.Services.AddScoped<IPoisonNotifier, PoisonNotifier>();
 
 /* ---------- Our app services ---------- */
 builder.Services.AddSingleton<IImagePreprocessor, ImagePreprocessor>();
@@ -108,9 +125,6 @@ builder.Services.AddSingleton<IReceiptApiClient>(sp =>
     var log = sp.GetRequiredService<ILogger<ReceiptApiClient>>();
     return new ReceiptApiClient(http, log, apiBase);
 });
-
-// If you implemented a poison notifier service, register it:
-// builder.Services.AddScoped<IPoisonNotifier, PoisonNotifier>();
 
 /* ---------- OCR service selection ---------- */
 var endpoint = GetCfg("COMPUTERVISION__ENDPOINT");
@@ -147,3 +161,6 @@ Console.WriteLine($"Has local.settings.json? {File.Exists(Path.Combine(Environme
 
 /* ---------- run ---------- */
 builder.Build().Run();
+
+/* ---------- Marker type for User Secrets ---------- */
+internal sealed class SecretsMarker { }

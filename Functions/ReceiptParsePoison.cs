@@ -1,4 +1,4 @@
-using Functions.Models;
+using Functions.Contracts.Messages;
 using Functions.Services.Abstractions;
 using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;

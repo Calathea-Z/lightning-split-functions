@@ -1,4 +1,4 @@
-﻿using Functions.Models;
+﻿using Functions.Contracts.Messages;
 
 namespace Functions.Services.Abstractions
 {

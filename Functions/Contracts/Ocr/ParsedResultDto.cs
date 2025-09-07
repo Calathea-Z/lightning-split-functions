@@ -1,4 +1,4 @@
-﻿namespace Functions.Dtos.Ocr
+﻿namespace Functions.Contracts.Ocr
 {
     public sealed class ParsedResult
     {

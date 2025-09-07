@@ -1,6 +1,6 @@
 ﻿using System.Net.Http.Headers;
 using System.Text.Json;
-using Functions.Dtos.Ocr;
+using Functions.Contracts.Ocr;
 using Functions.Services.Abstractions;
 using Microsoft.Extensions.Logging;
 

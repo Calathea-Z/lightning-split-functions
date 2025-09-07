@@ -52,10 +52,10 @@ namespace Functions.Services
             RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         // -------- Entry point --------
-        public static ParsedReceipt Extract(string? raw)
+        public static ParsedReceiptList Extract(string? raw)
         {
             if (string.IsNullOrWhiteSpace(raw))
-                return new ParsedReceipt(new List<ParsedItem>(), null, null, null, null, false);
+                return new ParsedReceiptList(new List<ItemHint>(), null, null, null, null, false);
 
             // 0) Normalize & split
             var rawLines = raw.Split('\n')
@@ -69,7 +69,7 @@ namespace Functions.Services
             // 1) Pre-merge: attach money-only lines to the previous line (totals-aware + qty-guard)
             var lines = MergeMoneyOnlyLines(rawLines);
 
-            var items = new List<ParsedItem>();
+            var items = new List<ItemHint>();
             decimal? subtotal = null, tax = null, tip = null, total = null;
 
             // 1.5) Preview printed SUBTOTAL if present (for tie-breakers near totals)
@@ -168,12 +168,12 @@ namespace Functions.Services
 
                                 if (chooseB)
                                 {
-                                    items.Add(new ParsedItem(rawDesc, qty, unitB, totalB));
+                                    items.Add(new ItemHint(rawDesc, qty, unitB, totalB));
                                     runningItemsSum = sumIfB;
                                 }
                                 else
                                 {
-                                    items.Add(new ParsedItem(rawDesc, qty, unitA, totalA));
+                                    items.Add(new ItemHint(rawDesc, qty, unitA, totalA));
                                     runningItemsSum = sumIfA;
                                 }
 
@@ -193,12 +193,12 @@ namespace Functions.Services
                                 var totalLine = unit; // qty=1
                                 if (pickTotal)
                                 {
-                                    items.Add(new ParsedItem(rawDesc, 1, unit, totalLine));
+                                    items.Add(new ItemHint(rawDesc, 1, unit, totalLine));
                                     runningItemsSum = asTotal;
                                 }
                                 else
                                 {
-                                    items.Add(new ParsedItem(rawDesc, 1, unit, totalLine));
+                                    items.Add(new ItemHint(rawDesc, 1, unit, totalLine));
                                     runningItemsSum = asUnit;
                                 }
                             }
@@ -206,7 +206,7 @@ namespace Functions.Services
                             {
                                 // default for qty=1 away from totals
                                 var unit = money;
-                                items.Add(new ParsedItem(rawDesc, 1, unit, unit));
+                                items.Add(new ItemHint(rawDesc, 1, unit, unit));
                                 runningItemsSum = Round2(runningItemsSum + unit);
                             }
 
@@ -230,7 +230,7 @@ namespace Functions.Services
                     var desc = Clean(StripQtyPrefix(m.Groups["desc"].Value));
                     if (desc.Length < 2) continue;
                     if (!TryMoney(m.Groups["price"].Value, out var p)) continue;
-                    items.Add(new ParsedItem(desc, 1, p, p));
+                    items.Add(new ItemHint(desc, 1, p, p));
                 }
                 items = items
                     .GroupBy(i => (i.Description.ToLowerInvariant(), i.TotalPrice ?? i.UnitPrice))
@@ -243,7 +243,7 @@ namespace Functions.Services
             if (total is null && items.Count > 0) total = Round2(sumItems + (tax ?? 0m) + (tip ?? 0m));
 
             var isSane = items.Count > 0 || (subtotal ?? 0m) > 0m || (total ?? 0m) > 0m;
-            return new ParsedReceipt(items, subtotal, tax, tip, total, isSane);
+            return new ParsedReceiptList(items, subtotal, tax, tip, total, isSane);
         }
 
         // -------- Helpers --------
@@ -352,7 +352,7 @@ namespace Functions.Services
             return null;
         }
 
-        private static bool TryTwoLineUnitTotal(IReadOnlyList<string> lines, int i, out ParsedItem? item)
+        private static bool TryTwoLineUnitTotal(IReadOnlyList<string> lines, int i, out ItemHint? item)
         {
             item = null;
             var line = lines[i];
@@ -365,13 +365,13 @@ namespace Functions.Services
             {
                 var desc = Clean(m.Groups["desc"].Value);
                 var qty = GuessQty(unit, tot);
-                item = new ParsedItem(desc, qty, unit, tot);
+                item = new ItemHint(desc, qty, unit, tot);
                 return true;
             }
             return false;
         }
 
-        private static bool TryMatch(Regex rx, string line, out ParsedItem? item)
+        private static bool TryMatch(Regex rx, string line, out ItemHint? item)
         {
             item = null;
             var m = rx.Match(line);
@@ -381,7 +381,7 @@ namespace Functions.Services
             {
                 var desc = Clean(StripQtyPrefix(m.Groups["desc"].Value));
                 if (TryMoney(m.Groups["price"].Value, out var price))
-                    item = new ParsedItem(desc, 1, price, price);
+                    item = new ItemHint(desc, 1, price, price);
             }
             else if (rx == UnitThenTotal)
             {
@@ -390,7 +390,7 @@ namespace Functions.Services
                     TryMoney(m.Groups["total"].Value, out var tot))
                 {
                     var qty = GuessQty(unit, tot);
-                    item = new ParsedItem(desc, qty, unit, tot);
+                    item = new ItemHint(desc, qty, unit, tot);
                 }
             }
             else if (rx == QtyTimesUnit)
@@ -400,7 +400,7 @@ namespace Functions.Services
                     TryMoney(m.Groups["unit"].Value, out var unit))
                 {
                     var tot = Round2(qty * unit);
-                    item = new ParsedItem(desc, qty, unit, tot);
+                    item = new ItemHint(desc, qty, unit, tot);
                 }
             }
             else // LeadingQtyThenUnit
@@ -410,7 +410,7 @@ namespace Functions.Services
                     TryMoney(m.Groups["unit"].Value, out var unit))
                 {
                     var tot = Round2(qty * unit);
-                    item = new ParsedItem(desc, qty, unit, tot);
+                    item = new ItemHint(desc, qty, unit, tot);
                 }
             }
             return item is not null;
