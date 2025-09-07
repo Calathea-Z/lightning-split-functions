@@ -44,15 +44,10 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
         {
             await PatchStatusAsync(receiptId, new UpdateStatusRequest(ReceiptStatus.FailedParse), ct);
         }
-        catch (InvalidOperationException ex)
+        catch (Exception ex)
         {
-            // Match your previous behavior: don't explode on 404
-            if (ex.Message.Contains(" 404:"))
-            {
-                log.LogInformation("Receipt {ReceiptId} not found when marking FailedParse.", receiptId);
-                return;
-            }
-            throw;
+            // Don't explode on any error - this is a best-effort operation
+            log.LogWarning(ex, "Failed to mark receipt {ReceiptId} as FailedParse", receiptId);
         }
 
         // 2) Attach reject reason to parse-meta (non-fatal if it fails)

@@ -3,6 +3,7 @@ using System.Net;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Api.Abstractions.Transport;
 using Functions.Services;
 using Microsoft.Extensions.Logging;
 using Moq;
@@ -68,16 +69,16 @@ public class ReceiptApiClientTests
         switch (method)
         {
             case "PATCH" when pathTemplate.Contains("rawtext"):
-                await apiClient.PatchRawTextAsync(receiptId, "Coffee $3.50", CancellationToken.None);
+                await apiClient.PatchRawTextAsync(receiptId, new UpdateRawTextRequest("Coffee $3.50"), CancellationToken.None);
                 break;
             case "PATCH" when pathTemplate.Contains("totals"):
-                await apiClient.PatchTotalsAsync(receiptId, 19.25m, 1.54m, 2.00m, 22.79m, CancellationToken.None);
+                await apiClient.PatchTotalsAsync(receiptId, new UpdateTotalsRequest(19.25m, 1.54m, 2.00m, 22.79m), CancellationToken.None);
                 break;
             case "PATCH" when pathTemplate.Contains("status"):
-                await apiClient.PatchStatusAsync(receiptId, "Parsed", CancellationToken.None);
+                await apiClient.PatchStatusAsync(receiptId, new UpdateStatusRequest(Api.Abstractions.Receipts.ReceiptStatus.Parsed), CancellationToken.None);
                 break;
             case "POST" when pathTemplate.Contains("items"):
-                await apiClient.PostItemAsync(receiptId, new { Label = "Coffee", Qty = 1, UnitPrice = 3.50m }, CancellationToken.None);
+                await apiClient.PostItemAsync(receiptId, new CreateReceiptItemRequest("Coffee", 1, 3.50m), CancellationToken.None);
                 break;
         }
 
@@ -98,7 +99,7 @@ public class ReceiptApiClientTests
         // Arrange
         var apiClient = CreateApiClient();
         var receiptId = Guid.NewGuid();
-        var itemDto = new { Label = "Coffee", Qty = 1, UnitPrice = 3.50m };
+        var itemDto = new CreateReceiptItemRequest("Coffee", 1, 3.50m);
 
         _mockHttpMessageHandler.Protected()
             .Setup<Task<HttpResponseMessage>>(
@@ -155,7 +156,7 @@ public class ReceiptApiClientTests
             });
 
         // Act
-        await apiClient.PatchRawTextAsync(receiptId, rawText, CancellationToken.None);
+        await apiClient.PatchRawTextAsync(receiptId, new UpdateRawTextRequest(rawText), CancellationToken.None);
 
         // Assert - Proves retry policy works
         Assert.Equal(2, attemptCount);
@@ -181,7 +182,7 @@ public class ReceiptApiClientTests
 
         // Act & Assert - One representative 4xx → throws
         await Assert.ThrowsAsync<InvalidOperationException>(() =>
-            apiClient.PatchTotalsAsync(receiptId, 19.25m, 1.54m, 2.00m, 22.79m, CancellationToken.None));
+            apiClient.PatchTotalsAsync(receiptId, new UpdateTotalsRequest(19.25m, 1.54m, 2.00m, 22.79m), CancellationToken.None));
     }
 
     [Theory]
@@ -209,9 +210,10 @@ public class ReceiptApiClientTests
         await apiClient.PostParseErrorAsync(receiptId, note, CancellationToken.None);
 
         // Assert - Should not throw exception, just log (most realistic race condition)
+        // PostParseErrorAsync makes 2 calls: one to patch status, one to patch parse-meta
         _mockHttpMessageHandler.Protected().Verify(
             "SendAsync",
-            Times.Once(),
+            Times.AtLeastOnce(),
             ItExpr.IsAny<HttpRequestMessage>(),
             ItExpr.IsAny<CancellationToken>());
     }
@@ -242,7 +244,7 @@ public class ReceiptApiClientTests
             });
 
         // Act
-        await apiClient.PatchRawTextAsync(receiptId, "test", token);
+        await apiClient.PatchRawTextAsync(receiptId, new UpdateRawTextRequest("test"), token);
 
         // Assert - Cancellation token is passed through
         Assert.NotNull(capturedToken);

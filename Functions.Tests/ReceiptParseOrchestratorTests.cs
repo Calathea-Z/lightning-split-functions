@@ -1,18 +1,12 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
-using System.Threading;
-using System.Threading.Tasks;
 using Api.Abstractions.Receipts;
+using Api.Abstractions.Transport;
 using Azure;
 using Azure.Core;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
-using Functions.Contracts.Messages;
 using Functions.Services;
 using Functions.Services.Abstractions;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Moq;
 using Xunit;
@@ -27,6 +21,7 @@ public class ReceiptParseOrchestratorTests
     private readonly Mock<IImagePreprocessor> _mockImagePreprocessor;
     private readonly Mock<IReceiptApiClient> _mockApiClient;
     private readonly Mock<IReceiptNormalizer> _mockNormalizer;
+    private readonly Mock<IConfiguration> _mockConfiguration;
     private readonly Mock<BlobContainerClient> _mockLockContainer;
     private readonly Mock<BlobClient> _mockLockBlob;
     private readonly Mock<BlobContainerClient> _mockReceiptContainer;
@@ -40,10 +35,14 @@ public class ReceiptParseOrchestratorTests
         _mockImagePreprocessor = new Mock<IImagePreprocessor>();
         _mockApiClient = new Mock<IReceiptApiClient>();
         _mockNormalizer = new Mock<IReceiptNormalizer>();
+        _mockConfiguration = new Mock<IConfiguration>();
         _mockLockContainer = new Mock<BlobContainerClient>();
         _mockLockBlob = new Mock<BlobClient>();
         _mockReceiptContainer = new Mock<BlobContainerClient>();
         _mockReceiptBlob = new Mock<BlobClient>();
+
+        // Setup configuration mock
+        _mockConfiguration.Setup(x => x["AOAI_DEPLOYMENT"]).Returns("test-model");
 
         // Container wiring
         _mockBlobServiceClient.Setup(x => x.GetBlobContainerClient("receipt-parse-locks"))
@@ -86,7 +85,8 @@ public class ReceiptParseOrchestratorTests
             _mockOcr.Object,
             _mockImagePreprocessor.Object,
             _mockApiClient.Object,
-            _mockNormalizer.Object);
+            _mockNormalizer.Object,
+            _mockConfiguration.Object);
 
     private static ReceiptParseMessage CreateTestMessage() =>
         new("receipts", "test-receipt.jpg", Guid.NewGuid().ToString());
@@ -125,25 +125,28 @@ public class ReceiptParseOrchestratorTests
             .ReturnsAsync(sunnyMartText);
 
         // API calls
-        var postedItems = new List<object>();
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, sunnyMartText, It.IsAny<CancellationToken>()))
+        var postedItems = new List<CreateReceiptItemRequest>();
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()))
-            .Callback<Guid, object, CancellationToken>((_, item, _) => postedItems.Add(item))
+        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<Guid, CreateReceiptItemRequest, CancellationToken>((_, item, _) => postedItems.Add(item))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, 20.25m, 1.54m, 2.00m, 22.79m, It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, It.IsAny<UpdateStatusRequest>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockApiClient.Setup(x => x.PatchParseMetaAsync(receiptId, It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
         await orchestrator.RunAsync(message, CancellationToken.None);
 
         // Assert
-        _mockApiClient.Verify(x => x.PatchRawTextAsync(receiptId, sunnyMartText, It.IsAny<CancellationToken>()), Times.Once);
-        _mockApiClient.Verify(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Exactly(5));
-        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, 20.25m, 1.54m, 2.00m, 22.79m, It.IsAny<CancellationToken>()), Times.AtLeastOnce());
-        _mockApiClient.Verify(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()), Times.Once);
+        _mockApiClient.Verify(x => x.PatchRawTextAsync(receiptId, It.Is<UpdateRawTextRequest>(r => r.RawText == sunnyMartText), It.IsAny<CancellationToken>()), Times.Once);
+        _mockApiClient.Verify(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()), Times.Exactly(5));
+        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()), Times.AtLeastOnce());
+        _mockApiClient.Verify(x => x.PatchStatusAsync(receiptId, It.Is<UpdateStatusRequest>(r => r.Status == ReceiptStatus.Parsed), It.IsAny<CancellationToken>()), Times.Once);
+        _mockApiClient.Verify(x => x.PatchParseMetaAsync(receiptId, It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()), Times.Once);
         Assert.Equal(5, postedItems.Count);
 
         _mockLockBlob.Verify(x => x.DeleteIfExistsAsync(
@@ -186,13 +189,15 @@ public class ReceiptParseOrchestratorTests
                 return Task.FromResult("Coffee $3.50\nTotal: $3.50");
             });
 
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<object>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(It.IsAny<Guid>(), It.IsAny<decimal?>(), It.IsAny<decimal?>(), It.IsAny<decimal?>(), It.IsAny<decimal>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(It.IsAny<Guid>(), It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(It.IsAny<Guid>(), It.IsAny<UpdateStatusRequest>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockApiClient.Setup(x => x.PatchParseMetaAsync(It.IsAny<Guid>(), It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
@@ -236,8 +241,8 @@ public class ReceiptParseOrchestratorTests
         // Act & Assert
         await Assert.ThrowsAsync<InvalidOperationException>(() => orchestrator.RunAsync(message, CancellationToken.None));
 
-        _mockApiClient.Verify(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        _mockApiClient.Verify(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Never);
+        _mockApiClient.Verify(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        _mockApiClient.Verify(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()), Times.Never);
 
         _mockLockBlob.Verify(x => x.DeleteIfExistsAsync(
             It.IsAny<DeleteSnapshotsOption>(),
@@ -273,22 +278,24 @@ public class ReceiptParseOrchestratorTests
         _mockOcr.Setup(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(textWithAdjustments);
 
-        var postedItems = new List<object>();
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, textWithAdjustments, It.IsAny<CancellationToken>()))
+        var postedItems = new List<CreateReceiptItemRequest>();
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()))
-            .Callback<Guid, object, CancellationToken>((_, item, __) => postedItems.Add(item))
+        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<Guid, CreateReceiptItemRequest, CancellationToken>((_, item, __) => postedItems.Add(item))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(It.IsAny<Guid>(), It.IsAny<decimal?>(), It.IsAny<decimal?>(), It.IsAny<decimal?>(), It.IsAny<decimal>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(It.IsAny<Guid>(), It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(It.IsAny<Guid>(), It.IsAny<UpdateStatusRequest>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockApiClient.Setup(x => x.PatchParseMetaAsync(It.IsAny<Guid>(), It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
         await orchestrator.RunAsync(message, CancellationToken.None);
 
         // Assert
-        _mockApiClient.Verify(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
+        _mockApiClient.Verify(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()), Times.Exactly(2));
         Assert.Equal(2, postedItems.Count);
     }
 
@@ -319,14 +326,14 @@ public class ReceiptParseOrchestratorTests
         _mockOcr.Setup(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync("Coffee $3.50\nSandwich $8.75");
 
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<string>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()))
             .ThrowsAsync(new HttpRequestException("Transient error"));
 
         // Act & Assert
         await Assert.ThrowsAsync<HttpRequestException>(() => orchestrator.RunAsync(message, CancellationToken.None));
-        _mockApiClient.Verify(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Once);
+        _mockApiClient.Verify(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()), Times.Once);
 
         _mockLockBlob.Verify(x => x.DeleteIfExistsAsync(
             It.IsAny<DeleteSnapshotsOption>(),
@@ -362,29 +369,30 @@ public class ReceiptParseOrchestratorTests
         _mockOcr.Setup(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(textWithoutSubtotal);
 
-        var finalTotals = new List<(decimal? sub, decimal? tax, decimal? tip, decimal total)>();
+        var finalTotals = new List<UpdateTotalsRequest>();
 
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, textWithoutSubtotal, It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, 12.25m, 1.54m, null, 13.79m, It.IsAny<CancellationToken>()))
-            .Callback<Guid, decimal?, decimal?, decimal?, decimal, CancellationToken>((_, sub, tax, tip, total, __) =>
-                finalTotals.Add((sub, tax, tip, total)))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<Guid, UpdateTotalsRequest, CancellationToken>((_, totals, __) => finalTotals.Add(totals))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, It.IsAny<UpdateStatusRequest>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockApiClient.Setup(x => x.PatchParseMetaAsync(receiptId, It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
         await orchestrator.RunAsync(message, CancellationToken.None);
 
         // Assert
-        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, 12.25m, 1.54m, null, 13.79m, It.IsAny<CancellationToken>()), Times.AtLeastOnce());
+        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()), Times.AtLeastOnce());
         Assert.True(finalTotals.Count >= 1);
         var last = finalTotals.Last();
-        Assert.Equal(12.25m, last.sub);
-        Assert.Equal(1.54m, last.tax);
-        Assert.Equal(13.79m, last.total);
+        Assert.Equal(12.25m, last.SubTotal);
+        Assert.Equal(1.54m, last.Tax);
+        Assert.Equal(13.79m, last.Total);
     }
 
     [Fact]
@@ -415,30 +423,31 @@ public class ReceiptParseOrchestratorTests
         _mockOcr.Setup(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(textWithoutTotal);
 
-        var finalTotals = new List<(decimal? sub, decimal? tax, decimal? tip, decimal total)>();
+        var finalTotals = new List<UpdateTotalsRequest>();
 
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, textWithoutTotal, It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, 12.25m, 1.54m, 2.00m, 15.79m, It.IsAny<CancellationToken>()))
-            .Callback<Guid, decimal?, decimal?, decimal?, decimal, CancellationToken>((_, sub, tax, tip, total, __) =>
-                finalTotals.Add((sub, tax, tip, total)))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<Guid, UpdateTotalsRequest, CancellationToken>((_, totals, __) => finalTotals.Add(totals))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, It.IsAny<UpdateStatusRequest>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockApiClient.Setup(x => x.PatchParseMetaAsync(receiptId, It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
         await orchestrator.RunAsync(message, CancellationToken.None);
 
         // Assert
-        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, 12.25m, 1.54m, 2.00m, 15.79m, It.IsAny<CancellationToken>()), Times.AtLeastOnce());
+        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()), Times.AtLeastOnce());
         Assert.True(finalTotals.Count >= 1);
         var last = finalTotals.Last();
-        Assert.Equal(12.25m, last.sub);
-        Assert.Equal(1.54m, last.tax);
-        Assert.Equal(2.00m, last.tip);
-        Assert.Equal(15.79m, last.total);
+        Assert.Equal(12.25m, last.SubTotal);
+        Assert.Equal(1.54m, last.Tax);
+        Assert.Equal(2.00m, last.Tip);
+        Assert.Equal(15.79m, last.Total);
     }
 
     [Fact]
@@ -469,30 +478,31 @@ public class ReceiptParseOrchestratorTests
         _mockOcr.Setup(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(textWithRounding);
 
-        var finalTotals = new List<(decimal? sub, decimal? tax, decimal? tip, decimal total)>();
+        var finalTotals = new List<UpdateTotalsRequest>();
 
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, textWithRounding, It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<object>(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PostItemAsync(receiptId, It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, 12.00m, 1.23m, 2.57m, 15.80m, It.IsAny<CancellationToken>()))
-            .Callback<Guid, decimal?, decimal?, decimal?, decimal, CancellationToken>((_, sub, tax, tip, total, __) =>
-                finalTotals.Add((sub, tax, tip, total)))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()))
+            .Callback<Guid, UpdateTotalsRequest, CancellationToken>((_, totals, __) => finalTotals.Add(totals))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.Parsed.ToString(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, It.IsAny<UpdateStatusRequest>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockApiClient.Setup(x => x.PatchParseMetaAsync(receiptId, It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
         await orchestrator.RunAsync(message, CancellationToken.None);
 
         // Assert
-        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, 12.00m, 1.23m, 2.57m, 15.80m, It.IsAny<CancellationToken>()), Times.AtLeastOnce());
+        _mockApiClient.Verify(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()), Times.AtLeastOnce());
         Assert.True(finalTotals.Count >= 1);
         var last = finalTotals.Last();
-        Assert.Equal(12.00m, last.sub);
-        Assert.Equal(1.23m, last.tax);
-        Assert.Equal(2.57m, last.tip);
-        Assert.Equal(15.80m, last.total);
+        Assert.Equal(12.00m, last.SubTotal);
+        Assert.Equal(1.23m, last.Tax);
+        Assert.Equal(2.57m, last.Tip);
+        Assert.Equal(15.80m, last.Total);
     }
 
     [Fact]
@@ -515,7 +525,7 @@ public class ReceiptParseOrchestratorTests
         // Assert
         _mockReceiptBlob.Verify(x => x.GetPropertiesAsync(It.IsAny<BlobRequestConditions>(), It.IsAny<CancellationToken>()), Times.Never);
         _mockOcr.Verify(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()), Times.Never);
-        _mockApiClient.Verify(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
+        _mockApiClient.Verify(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()), Times.Never);
     }
 
     [Fact]
@@ -572,19 +582,21 @@ public class ReceiptParseOrchestratorTests
         _mockOcr.Setup(x => x.ReadAsync(It.IsAny<Stream>(), It.IsAny<CancellationToken>()))
             .ReturnsAsync(emptyText);
 
-        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, emptyText, It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchRawTextAsync(receiptId, It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, null, null, null, 0m, It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchTotalsAsync(receiptId, It.IsAny<UpdateTotalsRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
-        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, ReceiptStatus.ParsedNeedsReview.ToString(), It.IsAny<CancellationToken>()))
+        _mockApiClient.Setup(x => x.PatchStatusAsync(receiptId, It.IsAny<UpdateStatusRequest>(), It.IsAny<CancellationToken>()))
+            .Returns(Task.CompletedTask);
+        _mockApiClient.Setup(x => x.PatchParseMetaAsync(receiptId, It.IsAny<UpdateParseMetaRequest>(), It.IsAny<CancellationToken>()))
             .Returns(Task.CompletedTask);
 
         // Act
         await orchestrator.RunAsync(message, CancellationToken.None);
 
         // Assert
-        _mockApiClient.Verify(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Never);
-        _mockApiClient.Verify(x => x.PatchStatusAsync(receiptId, ReceiptStatus.ParsedNeedsReview.ToString(), It.IsAny<CancellationToken>()), Times.Once);
+        _mockApiClient.Verify(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        _mockApiClient.Verify(x => x.PatchStatusAsync(receiptId, It.Is<UpdateStatusRequest>(r => r.Status == ReceiptStatus.ParsedNeedsReview), It.IsAny<CancellationToken>()), Times.Once);
     }
 
     [Fact]
@@ -642,8 +654,8 @@ public class ReceiptParseOrchestratorTests
         // Act & Assert
         await Assert.ThrowsAsync<RequestFailedException>(() => orchestrator.RunAsync(message, CancellationToken.None));
 
-        _mockApiClient.Verify(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<string>(), It.IsAny<CancellationToken>()), Times.Never);
-        _mockApiClient.Verify(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<object>(), It.IsAny<CancellationToken>()), Times.Never);
+        _mockApiClient.Verify(x => x.PatchRawTextAsync(It.IsAny<Guid>(), It.IsAny<UpdateRawTextRequest>(), It.IsAny<CancellationToken>()), Times.Never);
+        _mockApiClient.Verify(x => x.PostItemAsync(It.IsAny<Guid>(), It.IsAny<CreateReceiptItemRequest>(), It.IsAny<CancellationToken>()), Times.Never);
 
         _mockLockBlob.Verify(x => x.DeleteIfExistsAsync(
             It.IsAny<DeleteSnapshotsOption>(),
