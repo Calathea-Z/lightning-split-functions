@@ -46,9 +46,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
 
         _llmModelTag =
             _cfg["AOAI_DEPLOYMENT"] ??
-            _cfg["Values:AOAI_DEPLOYMENT"] ??
             Environment.GetEnvironmentVariable("AOAI_DEPLOYMENT") ??
-            Environment.GetEnvironmentVariable("Values:AOAI_DEPLOYMENT") ??
             "unknown";
     }
 
