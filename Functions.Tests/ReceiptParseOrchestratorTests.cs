@@ -1,7 +1,6 @@
 using Api.Abstractions.Receipts;
 using Api.Abstractions.Transport;
 using Azure;
-using Azure.Core;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Functions.Services;
