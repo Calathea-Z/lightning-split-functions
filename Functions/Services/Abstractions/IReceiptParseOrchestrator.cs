@@ -1,4 +1,4 @@
-﻿using Functions.Contracts.Messages;
+﻿using Api.Abstractions.Transport;
 
 namespace Functions.Services.Abstractions
 {

@@ -1,4 +1,4 @@
-﻿using Functions.Contracts.Messages;
+﻿using Api.Abstractions.Transport;
 using Functions.Infrastructure.Logging;
 using Functions.Services.Abstractions;
 using Microsoft.Azure.Functions.Worker;

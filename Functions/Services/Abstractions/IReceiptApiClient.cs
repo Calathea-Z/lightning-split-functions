@@ -1,18 +1,13 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
-using System.Threading.Tasks;
+﻿using Api.Abstractions.Transport;
 
 namespace Functions.Services.Abstractions
 {
     public interface IReceiptApiClient
     {
-        Task PatchRawTextAsync(Guid id, string text, CancellationToken ct);
-        Task PatchTotalsAsync(Guid id, decimal? sub, decimal? tax, decimal? tip, decimal total, CancellationToken ct);
-        Task PatchReviewAsync(Guid id, decimal? reconcileDelta, bool needsReview, CancellationToken ct);
-        Task PatchStatusAsync(Guid id, string status, CancellationToken ct);
-        Task PostItemAsync(Guid id, object dto, CancellationToken ct);
-        Task PostParseErrorAsync(Guid receiptId, string note, CancellationToken ct);
+        Task PostItemAsync(Guid receiptId, CreateReceiptItemRequest request, CancellationToken ct = default);
+        Task PatchTotalsAsync(Guid receiptId, UpdateTotalsRequest request, CancellationToken ct = default);
+        Task PatchStatusAsync(Guid receiptId, UpdateStatusRequest request, CancellationToken ct = default);
+        Task PatchRawTextAsync(Guid receiptId, UpdateRawTextRequest request, CancellationToken ct = default);
+        Task PatchParseMetaAsync(Guid receiptId, UpdateParseMetaRequest request, CancellationToken ct = default);
     }
 }

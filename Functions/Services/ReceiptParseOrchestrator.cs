@@ -1,26 +1,19 @@
-﻿// Functions/Services/ReceiptParseOrchestrator.cs
-using Api.Abstractions.Receipts;
+﻿using Api.Abstractions.Receipts;
+using Api.Abstractions.Transport;
 using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using Functions.Contracts.HeuristicExtractor;
-using Functions.Contracts.Messages;
 using Functions.Contracts.Parsing;
-using Functions.Contracts.Receipts;
 using Functions.Infrastructure.Logging;
 using Functions.Infrastructure.Resilience;
 using Functions.Services.Abstractions;
 using Functions.Validation;
 using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
 using System.Text.Json;
 using System.Text.RegularExpressions;
-using System.Threading;
-using System.Threading.Tasks;
+// alias for brevity
+using ParseEngine = Api.Abstractions.Receipts.ParseEngine;
 
 namespace Functions.Services;
 
@@ -135,27 +128,28 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
 
                 // 3) OCR (each retry uses a NEW MemoryStream over the same bytes)
                 _log.OcrRequested(rid, _ocr.GetType().Name);
-                var rawText = await Retry.RetryAsync<string?>(
+                string rawText = await Retry.RetryAsync(
                     op: "ocr.read",
                     perAttemptTimeout: OcrTimeout,
                     action: ct2 =>
                     {
                         var fresh = new MemoryStream(preBytes, writable: false);
-                        return _ocr.ReadAsync(fresh, ct2);
+                        return _ocr.ReadAsync(fresh, ct2); // returns Task<string>
                     },
                     isTransient: IsTransientOcr,
                     maxAttempts: 3,
                     log: _log,
                     outer: ct
-                );
+);
+
                 if (string.IsNullOrWhiteSpace(rawText))
                     _log.LogWarning("OCR returned empty text");
 
-                // 4) Persist raw (idempotent)
+                // 4) Persist raw (idempotent) — DTO ctor
                 await Retry.RetryAsync(
                     op: "api.patchRaw",
                     perAttemptTimeout: ApiTimeout,
-                    action: ct2 => _api.PatchRawTextAsync(rid, rawText ?? string.Empty, ct2),
+                    action: ct2 => _api.PatchRawTextAsync(rid, new UpdateRawTextRequest(rawText ?? string.Empty), ct2),
                     isTransient: IsTransientApi,
                     maxAttempts: 3,
                     log: _log,
@@ -166,6 +160,10 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 _log.LogInformation("Heuristics found {Count} items", heur.Items.Count);
                 if (!heur.IsSane || heur.Items.Count == 0)
                     _log.NeedsReview(rid, "Weak heuristic extraction");
+
+                bool llmAttempted = false;
+                bool? llmAccepted = null;
+                string? llmModel = null;
 
                 // 6) Decide: heuristics strong? If yes, skip LLM and finish fast
                 if (IsHeuristicsStrong(heur, out var strongReason))
@@ -181,7 +179,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         if (string.Equals(desc, "Adjustment", StringComparison.OrdinalIgnoreCase)) { skippedNonItem++; continue; }
                         if (string.Equals(desc, "Discount/Adjustment", StringComparison.OrdinalIgnoreCase)) { skippedNonItem++; continue; }
 
-                        var outcome = await TryPostItemAsync(rid, desc, it.Qty, it.UnitPrice, ct);
+                        var outcome = await TryPostItemAsync(rid, desc, it.Qty, it.UnitPrice, isLlm: false, ct);
                         switch (outcome)
                         {
                             case PostOutcome.Posted: posted++; break;
@@ -193,7 +191,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     _log.LogInformation("Post summary (heur-strong): posted={Posted}, skippedNonItem={NonItem}, skippedBad={Bad}, skippedEmpty={Empty}",
                         posted, skippedNonItem, skippedBad, skippedEmpty);
 
-                    // Totals
+                    // Totals -> DTO ctor
                     var sumOfItems = heur.Items.Sum(i => i.UnitPrice * i.Qty);
                     decimal? subOpt = heur.Subtotal ?? (heur.Items.Count > 0 ? Round2(sumOfItems) : null);
                     decimal? taxOpt = heur.Tax;
@@ -204,10 +202,12 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     decimal? taxRounded = taxOpt is null ? null : Round2(taxOpt.Value);
                     decimal? tipRounded = tipOpt is null ? null : Round2(tipOpt.Value);
 
+                    var totalsReq = new UpdateTotalsRequest(subRounded, taxRounded, tipRounded, totalRounded);
+
                     await Retry.RetryAsync(
                         op: "api.patchTotals",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchTotalsAsync(rid, subRounded, taxRounded, tipRounded, totalRounded, ct2),
+                        action: ct2 => _api.PatchTotalsAsync(rid, totalsReq, ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
@@ -216,7 +216,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     await Retry.RetryAsync(
                         op: "api.patchStatus",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchStatusAsync(rid, ReceiptStatus.Parsed.ToString(), ct2),
+                        action: ct2 => _api.PatchStatusAsync(rid, new UpdateStatusRequest(ReceiptStatus.Parsed), ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
@@ -225,11 +225,29 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     await Retry.RetryAsync(
                         op: "api.patchTotals.final",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchTotalsAsync(rid, subRounded, taxRounded, tipRounded, totalRounded, ct2),
+                        action: ct2 => _api.PatchTotalsAsync(rid, totalsReq, ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
                         outer: ct);
+
+                    await Retry.RetryAsync(
+                         op: "api.patchParseMeta.heuristics",
+                         perAttemptTimeout: ApiTimeout,
+                         action: ct2 => _api.PatchParseMetaAsync(
+                             rid,
+                             new UpdateParseMetaRequest(
+                                 ParsedBy: ParseEngine.Heuristics,
+                                 LlmAttempted: llmAttempted,
+                                 LlmAccepted: llmAccepted,
+                                 LlmModel: llmModel,
+                                 ParserVersion: null,
+                                 RejectReason: strongReason),
+                             ct2),
+                         isTransient: IsTransientApi,
+                         maxAttempts: 3,
+                         log: _log,
+                         outer: ct);
 
                     _log.Parsed(rid, posted, subRounded ?? 0m, taxRounded ?? 0m, totalRounded);
                     return; // done
@@ -239,15 +257,18 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 await Retry.RetryAsync(
                     op: "api.patchStatus.needsReview",
                     perAttemptTimeout: ApiTimeout,
-                    action: ct2 => _api.PatchStatusAsync(rid, ReceiptStatus.ParsedNeedsReview.ToString(), ct2),
+                    action: ct2 => _api.PatchStatusAsync(rid, new UpdateStatusRequest(ReceiptStatus.ParsedNeedsReview), ct2),
                     isTransient: IsTransientApi,
                     maxAttempts: 3,
                     log: _log,
                     outer: ct);
 
+                llmAttempted = true;
+
                 ParsedReceiptV1? parsed = null;
                 bool valid = false;
                 decimal itemsSum = 0m;
+                string? llmReason = null;
 
                 try
                 {
@@ -272,12 +293,20 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         {
                             _log.LogWarning("Parsed receipt failed validation: {Err}", err);
                             parsed.Issues.Add(err);
+                            llmReason = err;
                         }
+                        // If your normalizer exposes a model name, set it here:
+                        // llmModel = _normalizer.ModelName;
+                    }
+                    else
+                    {
+                        llmReason = "normalizer_null";
                     }
                 }
                 catch (Exception ex)
                 {
                     _log.LogWarning(ex, "Normalizer failed; will use heuristics fallback.");
+                    llmReason = "normalizer_exception";
                 }
 
                 int finalPosted = 0, finalSkippedNonItem = 0, finalSkippedBad = 0, finalSkippedEmpty = 0;
@@ -288,6 +317,8 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
 
                 if (valid && parsed is not null)
                 {
+                    llmAccepted = true;
+
                     // LLM path
                     foreach (var it in parsed.Items)
                     {
@@ -296,7 +327,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         if (string.Equals(desc, "Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
                         if (string.Equals(desc, "Discount/Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
 
-                        var outcome = await TryPostItemAsync(rid, desc, it.Quantity, it.UnitPrice, ct);
+                        var outcome = await TryPostItemAsync(rid, desc, it.Quantity, it.UnitPrice, isLlm: true, ct);
                         switch (outcome)
                         {
                             case PostOutcome.Posted: finalPosted++; break;
@@ -318,10 +349,12 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     taxRoundedFinal = taxOpt is null ? null : Round2(taxOpt.Value);
                     tipRoundedFinal = tipOpt is null ? null : Round2(tipOpt.Value);
 
+                    var totalsReq = new UpdateTotalsRequest(subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal);
+
                     await Retry.RetryAsync(
                         op: "api.patchTotals",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchTotalsAsync(rid, subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal, ct2),
+                        action: ct2 => _api.PatchTotalsAsync(rid, totalsReq, ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
@@ -331,7 +364,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     await Retry.RetryAsync(
                         op: "api.patchStatus.upgrade",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchStatusAsync(rid, ReceiptStatus.Parsed.ToString(), ct2),
+                        action: ct2 => _api.PatchStatusAsync(rid, new UpdateStatusRequest(ReceiptStatus.Parsed), ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
@@ -340,7 +373,25 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     await Retry.RetryAsync(
                         op: "api.patchTotals.final",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchTotalsAsync(rid, subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal, ct2),
+                        action: ct2 => _api.PatchTotalsAsync(rid, totalsReq, ct2),
+                        isTransient: IsTransientApi,
+                        maxAttempts: 3,
+                        log: _log,
+                        outer: ct);
+
+                    await Retry.RetryAsync(
+                        op: "api.patchParseMeta.llm",
+                        perAttemptTimeout: ApiTimeout,
+                        action: ct2 => _api.PatchParseMetaAsync(
+                            rid,
+                            new UpdateParseMetaRequest(
+                                ParsedBy: ParseEngine.Llm,
+                                LlmAttempted: llmAttempted,
+                                LlmAccepted: llmAccepted,
+                                LlmModel: llmModel,
+                                ParserVersion: null,
+                                RejectReason: null),
+                            ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
@@ -350,6 +401,8 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 }
                 else
                 {
+                    llmAccepted = false;
+
                     // Fallback: heuristics (keep status = ParsedNeedsReview)
                     foreach (var it in heur.Items)
                     {
@@ -358,7 +411,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         if (string.Equals(desc, "Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
                         if (string.Equals(desc, "Discount/Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
 
-                        var outcome = await TryPostItemAsync(rid, desc, it.Qty, it.UnitPrice, ct);
+                        var outcome = await TryPostItemAsync(rid, desc, it.Qty, it.UnitPrice, isLlm: false, ct);
                         switch (outcome)
                         {
                             case PostOutcome.Posted: finalPosted++; break;
@@ -380,10 +433,12 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     taxRoundedFinal = taxOpt is null ? null : Round2(taxOpt.Value);
                     tipRoundedFinal = tipOpt is null ? null : Round2(tipOpt.Value);
 
+                    var totalsReq = new UpdateTotalsRequest(subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal);
+
                     await Retry.RetryAsync(
                         op: "api.patchTotals",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchTotalsAsync(rid, subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal, ct2),
+                        action: ct2 => _api.PatchTotalsAsync(rid, totalsReq, ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
@@ -392,7 +447,26 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     await Retry.RetryAsync(
                         op: "api.patchTotals.final",
                         perAttemptTimeout: ApiTimeout,
-                        action: ct2 => _api.PatchTotalsAsync(rid, subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal, ct2),
+                        action: ct2 => _api.PatchTotalsAsync(rid, totalsReq, ct2),
+                        isTransient: IsTransientApi,
+                        maxAttempts: 3,
+                        log: _log,
+                        outer: ct);
+
+
+                    await Retry.RetryAsync(
+                        op: "api.patchParseMeta.heur-fallback",
+                        perAttemptTimeout: ApiTimeout,
+                        action: ct2 => _api.PatchParseMetaAsync(
+                            rid,
+                            new UpdateParseMetaRequest(
+                                ParsedBy: ParseEngine.Heuristics,
+                                LlmAttempted: llmAttempted,
+                                LlmAccepted: llmAccepted,
+                                LlmModel: llmModel,
+                                ParserVersion: null,
+                                RejectReason: llmReason ?? "llm_rejected_or_invalid"),
+                            ct2),
                         isTransient: IsTransientApi,
                         maxAttempts: 3,
                         log: _log,
@@ -444,7 +518,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
     private enum PostOutcome { Posted, SkippedNonItem, SkippedBadValue, SkippedEmpty }
 
     // Returns outcome (posted vs skipped reason)
-    private async Task<PostOutcome> TryPostItemAsync(Guid rid, string desc, decimal qty, decimal unitPrice, CancellationToken ct)
+    private async Task<PostOutcome> TryPostItemAsync(Guid rid, string desc, decimal qty, decimal unitPrice, bool isLlm, CancellationToken ct)
     {
         var label = CleanLabel(desc);
 
@@ -457,7 +531,11 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
         // Normalize
         unitPrice = Math.Round(unitPrice, 2, MidpointRounding.AwayFromZero);
 
-        var payload = new CreateReceiptItemDto(Label: label, Qty: qty, UnitPrice: unitPrice);
+        var payload = new CreateReceiptItemRequest(Label: label, Qty: qty, UnitPrice: unitPrice)
+        {
+            Notes = isLlm ? "parsed:llm" : "parsed:heuristics"
+        };
+
         await _api.PostItemAsync(rid, payload, ct);
         return PostOutcome.Posted;
     }

@@ -1,8 +1,10 @@
-﻿using System.Net;
-using System.Net.Http.Json;
-using System.Text.Json;
+﻿using Api.Abstractions.Receipts;
+using Api.Abstractions.Transport;
 using Functions.Services.Abstractions;
 using Microsoft.Extensions.Logging;
+using System.Net;
+using System.Net.Http.Json;
+using System.Text.Json;
 
 namespace Functions.Services;
 
@@ -17,45 +19,34 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
         return c;
     }
 
-    public Task PatchRawTextAsync(Guid id, string text, CancellationToken ct) =>
-        PatchOrThrow($"/api/receipts/{id}/rawtext", new { rawText = text }, ct);
+    /* ---------- NuGet DTO-based methods ---------- */
 
-    public Task PatchTotalsAsync(Guid id, decimal? sub, decimal? tax, decimal? tip, decimal total, CancellationToken ct) =>
-        PatchOrThrow($"/api/receipts/{id}/totals", new { subTotal = sub, tax, tip, total }, ct);
+    public Task PostItemAsync(Guid id, CreateReceiptItemRequest request, CancellationToken ct = default) =>
+        Send(c => c.PostAsJsonAsync($"/api/receipts/{id:D}/items", request, JsonOpts, ct),
+             "POST", $"/api/receipts/{id:D}/items", id, ct,
+             throwOnError: false,  // do not blow up on a single bad line-item
+             allowRetry: false);   // avoid duping items on retry
 
-    public Task PatchReviewAsync(Guid id, decimal? reconcileDelta, bool needsReview, CancellationToken ct) =>
-        PatchOrThrow($"/api/receipts/{id}/review", new { ReconcileDelta = reconcileDelta, NeedsReview = needsReview }, ct);
+    public Task PatchTotalsAsync(Guid id, UpdateTotalsRequest request, CancellationToken ct = default) =>
+        PatchOrThrow($"/api/receipts/{id:D}/totals", request, ct);
 
-    public Task PatchStatusAsync(Guid id, string status, CancellationToken ct) =>
-        PatchOrThrow($"/api/receipts/{id}/status", new { status }, ct);
+    public Task PatchStatusAsync(Guid id, UpdateStatusRequest request, CancellationToken ct = default) =>
+        PatchOrThrow($"/api/receipts/{id:D}/status", request, ct);
 
-    public Task PostItemAsync(Guid id, object dto, CancellationToken ct) =>
-        Send(c => c.PostAsJsonAsync($"/api/receipts/{id}/items", dto, JsonOpts, ct),
-             "POST", $"/api/receipts/{id}/items", id, ct, throwOnError: false, allowRetry: false);
+    public Task PatchRawTextAsync(Guid id, UpdateRawTextRequest request, CancellationToken ct = default) =>
+        PatchOrThrow($"/api/receipts/{id:D}/rawtext", request, ct);
 
-    public async Task PostParseErrorAsync(Guid receiptId, string note, CancellationToken ct)
-    {
-        var url = $"/api/receipts/{receiptId}/parse-error";
-        using var resp = await New().PostAsJsonAsync(url, note, JsonOpts, ct);
+    public Task PatchParseMetaAsync(Guid id, UpdateParseMetaRequest request, CancellationToken ct = default) =>
+        PatchOrThrow($"/api/receipts/{id:D}/parse-meta", request, ct);
 
-        if (resp.IsSuccessStatusCode) return;
+    /* ---------- Private ---------- */
 
-        if (resp.StatusCode == HttpStatusCode.NotFound)
-        {
-            log.LogInformation("Receipt {ReceiptId} not found when marking FailedParse.", receiptId);
-            return;
-        }
-
-        var body = await SafeReadBodyAsync(resp, ct);
-        log.LogError("Failed to mark receipt {ReceiptId} as FailedParse. Status={Status} Body(first512)={Body}",
-            receiptId, (int)resp.StatusCode, Truncate(body, 512));
-    }
-
-    // ---------- Private ----------
     private async Task PatchOrThrow(string path, object dto, CancellationToken ct)
     {
-        using var resp = await Send(c => c.PatchAsJsonAsync(path, dto, JsonOpts, ct),
-                                    "PATCH", path, Guid.Empty, ct, throwOnError: true, allowRetry: true);
+        using var _ = await Send(c => c.PatchAsJsonAsync(path, dto, JsonOpts, ct),
+                                 "PATCH", path, Guid.Empty, ct,
+                                 throwOnError: true,
+                                 allowRetry: true);
     }
 
     private static readonly TimeSpan[] Backoff = {
@@ -100,11 +91,11 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
 
         if (!last.IsSuccessStatusCode)
         {
-            var body = await last.Content.ReadAsStringAsync(ct);
+            var body = await SafeReadBodyAsync(last, ct);
             if (throwOnError)
                 throw new InvalidOperationException($"{op} {path} failed {(int)last.StatusCode}: {body}");
 
-            log.LogWarning("{Op} {Path} failed {Status}: {Body}", op, path, (int)last.StatusCode, body);
+            log.LogWarning("{Op} {Path} failed {Status}: {Body}", op, path, (int)last.StatusCode, Truncate(body, 512));
         }
 
         return last;
