@@ -69,6 +69,10 @@ public sealed class ReceiptApiClient(IHttpClientFactory http, ILogger<ReceiptApi
         }
     }
 
+    public Task PutItemsAsync(Guid id, ReplaceReceiptItemsRequest req, CancellationToken ct = default) =>
+        Send(c => c.PutAsJsonAsync($"/api/receipts/{id}/items", req, JsonOpts, ct),
+         "PUT", $"/api/receipts/{id}/items", id, ct, throwOnError: true, allowRetry: false);
+
     #region Helpers 
     private async Task PatchOrThrow(string path, object dto, CancellationToken ct)
     {

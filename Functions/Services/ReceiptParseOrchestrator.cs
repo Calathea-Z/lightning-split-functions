@@ -57,7 +57,12 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
     private static readonly TimeSpan ShortTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan OcrTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ApiTimeout = TimeSpan.FromSeconds(10);
-    private static decimal Round2(decimal d) => Math.Round(d, 2, MidpointRounding.AwayFromZero);
+
+    private static decimal Round2(decimal d)
+        => Math.Round(d, 2, MidpointRounding.AwayFromZero);
+
+    private static decimal? Round2Opt(decimal? d)
+        => d.HasValue ? Math.Round(d.Value, 2, MidpointRounding.AwayFromZero) : (decimal?)null;
 
     private static readonly JsonSerializerOptions _jsonOpts = new()
     {
@@ -137,7 +142,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     preBytes = ms.ToArray();
                 }
 
-                // 3) OCR (each retry uses a NEW MemoryStream over the same bytes)
+                // 3) OCR
                 _log.OcrRequested(rid, _ocr.GetType().Name);
                 string rawText = await Retry.RetryAsync(
                     op: "ocr.read",
@@ -145,7 +150,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     action: ct2 =>
                     {
                         var fresh = new MemoryStream(preBytes, writable: false);
-                        return _ocr.ReadAsync(fresh, ct2); // returns Task<string>
+                        return _ocr.ReadAsync(fresh, ct2); // Task<string>
                     },
                     isTransient: IsTransientOcr,
                     maxAttempts: 3,
@@ -155,7 +160,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                 if (string.IsNullOrWhiteSpace(rawText))
                     _log.LogWarning("OCR returned empty text");
 
-                // 4) Persist raw (idempotent)
+                // 4) Persist raw
                 await Retry.RetryAsync(
                     op: "api.patchRaw",
                     perAttemptTimeout: ApiTimeout,
@@ -165,50 +170,43 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     log: _log,
                     outer: ct);
 
-                // 5) Heuristics (used for decision + fallback)
+                // 5) Heuristics
                 var heur = HeuristicExtractor.Extract(rawText);
                 _log.LogInformation("Heuristics found {Count} items", heur.Items.Count);
                 if (!heur.IsSane || heur.Items.Count == 0)
                     _log.NeedsReview(rid, "Weak heuristic extraction");
 
-                bool llmAttempted = false;
-
-                // 6) Decide: heuristics strong? If yes, skip LLM and finish fast
+                // 6) Decide
                 if (IsHeuristicsStrong(heur, out var strongReason))
                 {
                     _log.LogInformation("Skipping LLM: heuristics strong ({Reason})", strongReason);
 
-                    // Items (with guard + counters)
-                    int posted = 0, skippedNonItem = 0, skippedBad = 0, skippedEmpty = 0;
-                    foreach (var it in heur.Items)
-                    {
-                        var desc = (it.Description ?? string.Empty).Trim();
-                        if (desc.Length == 0) { skippedEmpty++; continue; }
-                        if (string.Equals(desc, "Adjustment", StringComparison.OrdinalIgnoreCase)) { skippedNonItem++; continue; }
-                        if (string.Equals(desc, "Discount/Adjustment", StringComparison.OrdinalIgnoreCase)) { skippedNonItem++; continue; }
+                    // Build & replace once
+                    var (items, posted, skippedNonItem, skippedBad, skippedEmpty) =
+                        BuildItemsFromHeuristics(heur, isLlm: false);
 
-                        var outcome = await TryPostItemAsync(rid, desc, it.Qty, it.UnitPrice, isLlm: false, ct);
-                        switch (outcome)
-                        {
-                            case PostOutcome.Posted: posted++; break;
-                            case PostOutcome.SkippedNonItem: skippedNonItem++; break;
-                            case PostOutcome.SkippedBadValue: skippedBad++; break;
-                            case PostOutcome.SkippedEmpty: skippedEmpty++; break;
-                        }
-                    }
-                    _log.LogInformation("Post summary (heur-strong): posted={Posted}, skippedNonItem={NonItem}, skippedBad={Bad}, skippedEmpty={Empty}",
+                    await Retry.RetryAsync(
+                        op: "api.putItems.heur-strong",
+                        perAttemptTimeout: ApiTimeout,
+                        action: ct2 => _api.PutItemsAsync(rid, new ReplaceReceiptItemsRequest(Items: items), ct2),
+                        isTransient: IsTransientApi,
+                        maxAttempts: 3,
+                        log: _log,
+                        outer: ct);
+
+                    _log.LogInformation("Replace summary (heur-strong): posted={Posted}, skippedNonItem={NonItem}, skippedBad={Bad}, skippedEmpty={Empty}",
                         posted, skippedNonItem, skippedBad, skippedEmpty);
 
                     // Totals
                     var sumOfItems = heur.Items.Sum(i => i.UnitPrice * i.Qty);
-                    decimal? subOpt = heur.Subtotal ?? (heur.Items.Count > 0 ? Round2(sumOfItems) : null);
+                    decimal? subOpt = heur.Subtotal ?? (heur.Items.Count > 0 ? Round2(sumOfItems) : (decimal?)null);
                     decimal? taxOpt = heur.Tax;
                     decimal? tipOpt = heur.Tip;
 
-                    var totalRounded = Round2(heur.Total ?? ((subOpt ?? 0m) + (taxOpt ?? 0m) + (tipOpt ?? 0m)));
-                    decimal? subRounded = subOpt is null ? null : Round2(subOpt.Value);
-                    decimal? taxRounded = taxOpt is null ? null : Round2(taxOpt.Value);
-                    decimal? tipRounded = tipOpt is null ? null : Round2(tipOpt.Value);
+                    decimal totalRounded = Round2(heur.Total ?? ((subOpt ?? 0m) + (taxOpt ?? 0m) + (tipOpt ?? 0m)));
+                    decimal? subRounded = Round2Opt(subOpt);
+                    decimal? taxRounded = Round2Opt(taxOpt);
+                    decimal? tipRounded = Round2Opt(tipOpt);
 
                     var totalsReq = new UpdateTotalsRequest(subRounded, taxRounded, tipRounded, totalRounded);
 
@@ -246,7 +244,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                             rid,
                             new UpdateParseMetaRequest(
                                 ParsedBy: ParseEngine.Heuristics,
-                                LlmAttempted: llmAttempted,
+                                LlmAttempted: false,
                                 LlmAccepted: null,
                                 LlmModel: null,
                                 ParserVersion: ParserVersionTag,
@@ -258,12 +256,10 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         outer: ct);
 
                     _log.Parsed(rid, posted, subRounded ?? 0m, taxRounded ?? 0m, totalRounded);
-                    return; // done
+                    return;
                 }
 
-                // 7) Heuristics weak -> try LLM (do NOT pre-mark NeedsReview here)
-                llmAttempted = true;
-
+                // 7) LLM attempt
                 ParsedReceiptV1? parsed = null;
                 bool valid = false;
                 decimal itemsSum = 0m;
@@ -306,47 +302,37 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                     llmReason = "normalizer_exception";
                 }
 
-                int finalPosted = 0, finalSkippedNonItem = 0, finalSkippedBad = 0, finalSkippedEmpty = 0;
-                decimal? subRoundedFinal;
-                decimal? taxRoundedFinal;
-                decimal? tipRoundedFinal;
-                decimal totalRoundedFinal;
-
                 if (valid && parsed is not null)
                 {
-                    // LLM path
-                    foreach (var it in parsed.Items)
-                    {
-                        var desc = (it.Description ?? string.Empty).Trim();
-                        if (desc.Length == 0) { finalSkippedEmpty++; continue; }
-                        if (string.Equals(desc, "Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
-                        if (string.Equals(desc, "Discount/Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
+                    // Replace with LLM items
+                    var (items, posted, skippedNonItem, skippedBad, skippedEmpty) =
+                        BuildItemsFromParsed(parsed, isLlm: true);
 
-                        var outcome = await TryPostItemAsync(rid, desc, it.Quantity, it.UnitPrice, isLlm: true, ct);
-                        switch (outcome)
-                        {
-                            case PostOutcome.Posted: finalPosted++; break;
-                            case PostOutcome.SkippedNonItem: finalSkippedNonItem++; break;
-                            case PostOutcome.SkippedBadValue: finalSkippedBad++; break;
-                            case PostOutcome.SkippedEmpty: finalSkippedEmpty++; break;
-                        }
-                    }
-                    _log.LogInformation("Post summary (LLM): posted={Posted}, skippedNonItem={NonItem}, skippedBad={Bad}, skippedEmpty={Empty}",
-                        finalPosted, finalSkippedNonItem, finalSkippedBad, finalSkippedEmpty);
+                    await Retry.RetryAsync(
+                        op: "api.putItems.llm",
+                        perAttemptTimeout: ApiTimeout,
+                        action: ct2 => _api.PutItemsAsync(rid, new ReplaceReceiptItemsRequest(Items: items), ct2),
+                        isTransient: IsTransientApi,
+                        maxAttempts: 3,
+                        log: _log,
+                        outer: ct);
 
+                    _log.LogInformation("Replace summary (LLM): posted={Posted}, skippedNonItem={NonItem}, skippedBad={Bad}, skippedEmpty={Empty}",
+                        posted, skippedNonItem, skippedBad, skippedEmpty);
+
+                    // Totals
                     var itemsSumLocal = parsed.Items.Sum(i => i.LineTotal);
-                    var subOpt = parsed.SubTotal ?? (parsed.Items.Count > 0 ? Round2(itemsSumLocal) : (decimal?)null);
-                    var taxOpt = parsed.Tax;
-                    var tipOpt = parsed.Tip;
+                    decimal? subOpt = parsed.SubTotal ?? (parsed.Items.Count > 0 ? Round2(itemsSumLocal) : (decimal?)null);
+                    decimal? taxOpt = parsed.Tax;
+                    decimal? tipOpt = parsed.Tip;
 
-                    totalRoundedFinal = Round2(parsed.Total ?? ((subOpt ?? 0m) + (taxOpt ?? 0m) + (tipOpt ?? 0m)));
-                    subRoundedFinal = subOpt is null ? null : Round2(subOpt.Value);
-                    taxRoundedFinal = taxOpt is null ? null : Round2(taxOpt.Value);
-                    tipRoundedFinal = tipOpt is null ? null : Round2(tipOpt.Value);
+                    decimal totalRoundedFinal = Round2(parsed.Total ?? ((subOpt ?? 0m) + (taxOpt ?? 0m) + (tipOpt ?? 0m)));
+                    decimal? subRoundedFinal = Round2Opt(subOpt);
+                    decimal? taxRoundedFinal = Round2Opt(taxOpt);
+                    decimal? tipRoundedFinal = Round2Opt(tipOpt);
 
                     var totalsReq = new UpdateTotalsRequest(subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal);
 
-                    // Totals
                     await Retry.RetryAsync(
                         op: "api.patchTotals",
                         perAttemptTimeout: ApiTimeout,
@@ -365,7 +351,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         log: _log,
                         outer: ct);
 
-                    // Parse meta (LLM accepted)
                     await Retry.RetryAsync(
                         op: "api.patchParseMeta.llm",
                         perAttemptTimeout: ApiTimeout,
@@ -384,7 +369,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         log: _log,
                         outer: ct);
 
-                    // Status LAST to clear any review flags
                     await Retry.RetryAsync(
                         op: "api.patchStatus.upgrade",
                         perAttemptTimeout: ApiTimeout,
@@ -394,39 +378,35 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         log: _log,
                         outer: ct);
 
-                    _log.Parsed(rid, finalPosted, subRoundedFinal ?? 0m, taxRoundedFinal ?? 0m, totalRoundedFinal);
+                    _log.Parsed(rid, posted, subRoundedFinal ?? 0m, taxRoundedFinal ?? 0m, totalRoundedFinal);
                 }
                 else
                 {
-                    // Heuristics fallback (LLM attempted but not accepted)
-                    foreach (var it in heur.Items)
-                    {
-                        var desc = (it.Description ?? string.Empty).Trim();
-                        if (desc.Length == 0) { finalSkippedEmpty++; continue; }
-                        if (string.Equals(desc, "Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
-                        if (string.Equals(desc, "Discount/Adjustment", StringComparison.OrdinalIgnoreCase)) { finalSkippedNonItem++; continue; }
+                    // Heuristics fallback
+                    var (items, posted, skippedNonItem, skippedBad, skippedEmpty) =
+                        BuildItemsFromHeuristics(heur, isLlm: false);
 
-                        var outcome = await TryPostItemAsync(rid, desc, it.Qty, it.UnitPrice, isLlm: false, ct);
-                        switch (outcome)
-                        {
-                            case PostOutcome.Posted: finalPosted++; break;
-                            case PostOutcome.SkippedNonItem: finalSkippedNonItem++; break;
-                            case PostOutcome.SkippedBadValue: finalSkippedBad++; break;
-                            case PostOutcome.SkippedEmpty: finalSkippedEmpty++; break;
-                        }
-                    }
-                    _log.LogInformation("Post summary (heur-fallback): posted={Posted}, skippedNonItem={NonItem}, skippedBad={Bad}, skippedEmpty={Empty}",
-                        finalPosted, finalSkippedNonItem, finalSkippedBad, finalSkippedEmpty);
+                    await Retry.RetryAsync(
+                        op: "api.putItems.heur-fallback",
+                        perAttemptTimeout: ApiTimeout,
+                        action: ct2 => _api.PutItemsAsync(rid, new ReplaceReceiptItemsRequest(Items: items), ct2),
+                        isTransient: IsTransientApi,
+                        maxAttempts: 3,
+                        log: _log,
+                        outer: ct);
+
+                    _log.LogInformation("Replace summary (heur-fallback): posted={Posted}, skippedNonItem={NonItem}, skippedBad={Bad}, skippedEmpty={Empty}",
+                        posted, skippedNonItem, skippedBad, skippedEmpty);
 
                     var sumOfItems = heur.Items.Sum(i => i.UnitPrice * i.Qty);
-                    decimal? subOpt = heur.Subtotal ?? (heur.Items.Count > 0 ? Round2(sumOfItems) : null);
+                    decimal? subOpt = heur.Subtotal ?? (heur.Items.Count > 0 ? Round2(sumOfItems) : (decimal?)null);
                     decimal? taxOpt = heur.Tax;
                     decimal? tipOpt = heur.Tip;
 
-                    totalRoundedFinal = Round2(heur.Total ?? ((subOpt ?? 0m) + (taxOpt ?? 0m) + (tipOpt ?? 0m)));
-                    subRoundedFinal = subOpt is null ? null : Round2(subOpt.Value);
-                    taxRoundedFinal = taxOpt is null ? null : Round2(taxOpt.Value);
-                    tipRoundedFinal = tipOpt is null ? null : Round2(tipOpt.Value);
+                    decimal totalRoundedFinal = Round2(heur.Total ?? ((subOpt ?? 0m) + (taxOpt ?? 0m) + (tipOpt ?? 0m)));
+                    decimal? subRoundedFinal = Round2Opt(subOpt);
+                    decimal? taxRoundedFinal = Round2Opt(taxOpt);
+                    decimal? tipRoundedFinal = Round2Opt(tipOpt);
 
                     var totalsReq = new UpdateTotalsRequest(subRoundedFinal, taxRoundedFinal, tipRoundedFinal, totalRoundedFinal);
 
@@ -466,7 +446,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         log: _log,
                         outer: ct);
 
-                    // Only here mark NeedsReview
                     await Retry.RetryAsync(
                         op: "api.patchStatus.needsReview",
                         perAttemptTimeout: ApiTimeout,
@@ -476,7 +455,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
                         log: _log,
                         outer: ct);
 
-                    _log.Parsed(rid, finalPosted, subRoundedFinal ?? 0m, taxRoundedFinal ?? 0m, totalRoundedFinal);
+                    _log.Parsed(rid, posted, subRoundedFinal ?? 0m, taxRoundedFinal ?? 0m, totalRoundedFinal);
                 }
             }
         }
@@ -489,20 +468,17 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
 
     #region Helpers
 
-    // Gate for “heuristics strong enough to skip LLM?”
     private static bool IsHeuristicsStrong(ParsedReceiptList heur, out string reason)
     {
         reason = "ok";
         if (heur.Items == null || heur.Items.Count == 0) { reason = "no_items"; return false; }
 
-        // validate items
         foreach (var i in heur.Items)
         {
             if (i.Qty <= 0 || i.UnitPrice < 0 || i.UnitPrice > 10000)
             { reason = "bad_item_values"; return false; }
         }
 
-        // math check (rounded to 2dp to avoid penny drift)
         decimal sum = 0m;
         foreach (var i in heur.Items) sum += i.UnitPrice * i.Qty;
         sum = Round2(sum);
@@ -510,8 +486,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
         if (heur.Subtotal is decimal s && Math.Abs(s - sum) > 0.02m)
         { reason = "sum_mismatch"; return false; }
 
-        // total present or computable is “good enough”
-        decimal? sub = heur.Subtotal ?? (heur.Items.Count > 0 ? sum : null);
+        decimal? sub = heur.Subtotal ?? (heur.Items.Count > 0 ? sum : (decimal?)null);
         decimal? tax = heur.Tax;
         decimal? tip = heur.Tip;
         var computed = (sub ?? 0m) + (tax ?? 0m) + (tip ?? 0m);
@@ -519,29 +494,43 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
         return (heur.Total is decimal t && t >= 0) || computed > 0m;
     }
 
-    private enum PostOutcome { Posted, SkippedNonItem, SkippedBadValue, SkippedEmpty }
+    private static (List<ReplaceReceiptItemDto> items, int posted, int skippedNonItem, int skippedBad, int skippedEmpty)
+        BuildItemsFromHeuristics(ParsedReceiptList heur, bool isLlm)
+        => BuildItems(
+            heur.Items.Select(i => (desc: i.Description ?? string.Empty, qty: (decimal)i.Qty, unitPrice: i.UnitPrice)),
+            isLlm);
 
-    // Returns outcome (posted vs skipped reason)
-    private async Task<PostOutcome> TryPostItemAsync(Guid rid, string desc, decimal qty, decimal unitPrice, bool isLlm, CancellationToken ct)
+    private static (List<ReplaceReceiptItemDto> items, int posted, int skippedNonItem, int skippedBad, int skippedEmpty)
+        BuildItemsFromParsed(ParsedReceiptV1 parsed, bool isLlm)
+        => BuildItems(
+            parsed.Items.Select(i => (desc: i.Description ?? string.Empty, qty: i.Quantity, unitPrice: i.UnitPrice)),
+            isLlm);
+
+    private static (List<ReplaceReceiptItemDto> items, int posted, int skippedNonItem, int skippedBad, int skippedEmpty)
+        BuildItems(IEnumerable<(string desc, decimal qty, decimal unitPrice)> source, bool isLlm)
     {
-        var label = CleanLabel(desc);
+        int posted = 0, skippedNonItem = 0, skippedBad = 0, skippedEmpty = 0;
+        var list = new List<ReplaceReceiptItemDto>();
 
-        if (string.IsNullOrWhiteSpace(label)) return PostOutcome.SkippedEmpty;
-        if (LooksLikeNonItem(label)) { _log.LogInformation("Skip item: non-item phrase '{Desc}'", label); return PostOutcome.SkippedNonItem; }
-
-        if (qty <= 0 || qty > 1000) { _log.LogWarning("Skip item: bad qty {Qty} '{Desc}'", qty, label); return PostOutcome.SkippedBadValue; }
-        if (unitPrice < 0 || unitPrice > 10000) { _log.LogWarning("Skip item: bad price {Price} '{Desc}'", unitPrice, label); return PostOutcome.SkippedBadValue; }
-
-        // Normalize
-        unitPrice = Math.Round(unitPrice, 2, MidpointRounding.AwayFromZero);
-
-        var payload = new CreateReceiptItemRequest(Label: label, Qty: qty, UnitPrice: unitPrice)
+        foreach (var (desc, qtyRaw, unitPriceRaw) in source)
         {
-            Notes = isLlm ? "parsed:llm" : "parsed:heuristics"
-        };
+            var label = CleanLabel(desc);
 
-        await _api.PostItemAsync(rid, payload, ct);
-        return PostOutcome.Posted;
+            if (string.IsNullOrWhiteSpace(label)) { skippedEmpty++; continue; }
+            if (LooksLikeNonItem(label)) { skippedNonItem++; continue; }
+
+            if (qtyRaw <= 0 || qtyRaw > 1000) { skippedBad++; continue; }
+            if (unitPriceRaw < 0 || unitPriceRaw > 10000) { skippedBad++; continue; }
+
+            var qty = qtyRaw;
+            var unitPrice = Math.Round(unitPriceRaw, 2, MidpointRounding.AwayFromZero);
+            var notes = isLlm ? "parsed:llm" : "parsed:heuristics";
+
+            list.Add(new ReplaceReceiptItemDto(label, qty, unitPrice, notes));
+            posted++;
+        }
+
+        return (list, posted, skippedNonItem, skippedBad, skippedEmpty);
     }
 
     private static bool IsTransientBlob(Exception ex)
@@ -553,7 +542,6 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
         => (ex is RequestFailedException rfe && (rfe.Status >= 500 || rfe.Status == 408 || rfe.Status == 429))
            || ex is HttpRequestException;
 
-    // Non-item guards for posting
     private static readonly Regex NonItemPhrase = new(
         @"\b(subtotal|sub\s*total|total(?!\s*wine)|amount\s*due|sales?\s*tax|tax|tip|gratuity|service(\s*fee)?|discount|promo|promotion|coupon|offer|save|spend|member|loyalty|rewards|bogo|%[\s-]*off|pre[-\s]?discount\s*subtotal|discount\s*total)\b",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -569,7 +557,7 @@ public class ReceiptParseOrchestrator : IReceiptParseOrchestrator
         if (string.IsNullOrWhiteSpace(desc)) return true;
         var d = desc.ToLowerInvariant();
         if (NonItemPhrase.IsMatch(d)) return true;
-        if (TrailingMinusOrParens.IsMatch(d)) return true; // e.g., "(5.16)" or "5.16-"
+        if (TrailingMinusOrParens.IsMatch(d)) return true;
         return false;
     }
 
